@@ -85,8 +85,8 @@ jobs:
         run: |
           $version = "dev"
           $arch = "x64"
-          $portableDir = "DBX_${version}_${arch}"
-          $zipName = "DBX_${version}_${arch}-portable.zip"
+          $portableDir = "DBX-${version}-${arch}"
+          $zipName = "DBX-${version}-${arch}-portable.zip"
           $exePath = "target/x86_64-pc-windows-msvc/release/dbx.exe"
 
           if (!(Test-Path $exePath)) {
