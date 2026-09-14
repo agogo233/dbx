@@ -9,6 +9,7 @@ import {
   connectionQueryExecutionSchema,
   connectionShouldDiscoverJdbcSchemas,
   connectionShouldLoadIdentifierQuote,
+  connectionTableSqlSchema,
   connectionUsesConnectionRootSchemaMode,
   connectionUsesDatabaseObjectTreeMode,
   effectiveDatabaseTypeForConnection,
@@ -92,6 +93,19 @@ describe("jdbc dialect inference", () => {
     ).toBe("sqlserver");
   });
 
+  it("detects TDengine JDBC connections and keeps the selected database in the object tree", () => {
+    const connection = {
+      db_type: "jdbc" as const,
+      connection_string: "jdbc:TAOS-RS://tdengine.example:6041/",
+      jdbc_driver_class: "com.taosdata.jdbc.rs.RestfulDriver",
+    };
+
+    expect(inferJdbcDialect(connection)).toBe("tdengine");
+    expect(effectiveDatabaseTypeForConnection(connection)).toBe("tdengine");
+    expect(connectionUsesDatabaseObjectTreeMode(connection)).toBe(false);
+    expect(connectionObjectTreeQuerySchema(connection, "dbx_test")).toBe("dbx_test");
+  });
+
   it("keeps Phoenix as generic JDBC while preserving its schema tree", () => {
     const connection = { db_type: "jdbc" as const, driver_profile: "phoenix" };
 
@@ -161,6 +175,12 @@ describe("jdbc dialect inference", () => {
   it("falls back to a flat table tree when GBase 8s reports no schemas", () => {
     expect(connectionShouldDiscoverJdbcSchemas({ db_type: "gbase", driver_profile: "gbase8s" })).toBe(true);
     expect(connectionShouldDiscoverJdbcSchemas({ db_type: "gbase", driver_profile: "gbase8a" })).toBe(false);
+  });
+
+  it("omits the metadata owner from GBase 8s table SQL", () => {
+    expect(connectionTableSqlSchema({ db_type: "gbase", driver_profile: "gbase8s" }, "gbasedbt")).toBeUndefined();
+    expect(connectionTableSqlSchema({ db_type: "gbase", driver_profile: "gbase8a" }, "analytics")).toBe("analytics");
+    expect(connectionTableSqlSchema({ db_type: "informix", driver_profile: "informix" }, "informix")).toBe("informix");
   });
 
   it("recognizes GaussDB reached through PostgreSQL-compatible JDBC drivers", () => {
