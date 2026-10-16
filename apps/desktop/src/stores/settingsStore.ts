@@ -1488,7 +1488,7 @@ export const DEFAULT_EDITOR_SETTINGS: EditorSettings = {
   generateSqlIncludeDatabaseName: false,
   generateSqlQuoteIdentifiers: true,
   formatSqlOnSqlFileSave: false,
-  updateNotificationsEnabled: true,
+  updateNotificationsEnabled: false,
   autoDownloadUpdates: true,
   autoUpdateApp: true,
   autoUpdateDrivers: true,
