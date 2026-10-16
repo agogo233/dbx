@@ -401,15 +401,15 @@ test("defaults auto-close brackets to on and preserves saved booleans", () => {
   assert.equal(normalizeEditorSettings({ autoCloseBrackets: "nope" as any }).autoCloseBrackets, true);
 });
 
-test("defaults update notifications to enabled", () => {
-  assert.equal(DEFAULT_EDITOR_SETTINGS.updateNotificationsEnabled, true);
-  assert.equal(DEFAULT_EDITOR_SETTINGS.autoUpdateApp, true);
+test("defaults update notifications to disabled", () => {
+  assert.equal(DEFAULT_EDITOR_SETTINGS.updateNotificationsEnabled, false);
+  assert.equal(DEFAULT_EDITOR_SETTINGS.autoUpdateApp, false);
   assert.equal(DEFAULT_EDITOR_SETTINGS.autoUpdateDrivers, true);
   assert.equal(DEFAULT_EDITOR_SETTINGS.autoUpdateJdbc, true);
   assert.equal(DEFAULT_EDITOR_SETTINGS.autoUpdateMcp, true);
   assert.equal(DEFAULT_EDITOR_SETTINGS.autoUpdatePlugins, true);
-  assert.equal(normalizeEditorSettings({}).updateNotificationsEnabled, true);
-  assert.equal(normalizeEditorSettings({}).autoUpdateApp, true);
+  assert.equal(normalizeEditorSettings({}).updateNotificationsEnabled, false);
+  assert.equal(normalizeEditorSettings({}).autoUpdateApp, false);
   assert.equal(normalizeEditorSettings({}).autoUpdateDrivers, true);
   assert.equal(normalizeEditorSettings({}).autoUpdateJdbc, true);
   assert.equal(normalizeEditorSettings({}).autoUpdateMcp, true);

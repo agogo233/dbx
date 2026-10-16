@@ -4941,6 +4941,7 @@ function openDriverStoreFromEvent(event: Event) {
 }
 
 function runUpdateNotificationChecks() {
+  if (!settingsStore.editorSettings.updateNotificationsEnabled) return;
   void refreshAgentDriverUpdateCount();
   void refreshMcpUpdateStatus();
   void componentUpdates.refresh();

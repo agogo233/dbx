@@ -89,16 +89,17 @@ describe("older version release pages", () => {
 });
 
 describe("silent update lifecycle", () => {
-  it("checks and shows a badge without downloading when automatic downloads are disabled", async () => {
+  it("does not check for updates when automatic updates are disabled", async () => {
     settings.autoUpdateApp = false;
     const updater = mount();
     await updater.initialize();
     await flush();
-    expect(mocks.checkForUpdates).toHaveBeenCalled();
+    expect(mocks.checkForUpdates).not.toHaveBeenCalled();
     expect(mocks.downloadUpdate).not.toHaveBeenCalled();
-    expect(updater.hasUpdateAvailable.value).toBe(true);
+    expect(updater.hasUpdateAvailable.value).toBe(false);
     expect(updater.showUpdateDialog.value).toBe(false);
     await updater.checkUpdates();
+    expect(mocks.checkForUpdates).toHaveBeenCalled();
     expect(updater.showUpdateDialog.value).toBe(true);
     expect(mocks.downloadUpdate).not.toHaveBeenCalled();
     await updater.downloadUpdateInBackground();
@@ -106,18 +107,24 @@ describe("silent update lifecycle", () => {
     expect(updater.updateDownloaded.value).toBe(true);
     expect(mocks.installDownloadedUpdate).not.toHaveBeenCalled();
   });
-  it("surfaces a newer release instead of a stale package with automatic downloads disabled", async () => {
+  it("surfaces a newer release via manual check when automatic updates are disabled", async () => {
     settings.autoUpdateApp = false;
     mocks.getDownloadedUpdate.mockResolvedValue(cache);
     mocks.checkForUpdates.mockResolvedValue({ ...info, latest_version: "1.2.0", release_name: "v1.2.0" });
     const updater = mount();
     await updater.initialize();
     await flush();
+    expect(updater.updateInfo.value?.latest_version).toBe(cache.version);
+    expect(mocks.discardDownloadedUpdate).not.toHaveBeenCalled();
+    expect(mocks.downloadUpdate).not.toHaveBeenCalled();
+    expect(updater.updateDownloaded.value).toBe(true);
+    expect(updater.hasUpdateAvailable.value).toBe(true);
+    await updater.checkUpdates();
+    expect(mocks.checkForUpdates).toHaveBeenCalled();
     expect(updater.updateInfo.value?.latest_version).toBe("1.2.0");
     expect(mocks.discardDownloadedUpdate).toHaveBeenCalledWith(cache.cache_id);
     expect(mocks.downloadUpdate).not.toHaveBeenCalled();
     expect(updater.updateDownloaded.value).toBe(false);
-    expect(updater.hasUpdateAvailable.value).toBe(true);
     await updater.installDownloadedUpdate();
     expect(mocks.installDownloadedUpdate).not.toHaveBeenCalled();
     mocks.downloadUpdate.mockResolvedValue({ ...cache, version: "1.2.0" });

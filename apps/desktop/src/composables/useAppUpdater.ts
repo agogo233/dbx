@@ -177,7 +177,7 @@ export function useAppUpdater(options: UseAppUpdaterOptions = {}) {
   }
   function scheduleRetry() {
     clearRetry();
-    if (!initialized || disposed || retries >= 3) return;
+    if (!initialized || disposed || retries >= 3 || !autoUpdateEnabled.value) return;
     const delay = [60_000, 300_000, 900_000][retries++];
     retryTimer = setTimeout(() => {
       retryTimer = undefined;
@@ -463,12 +463,12 @@ export function useAppUpdater(options: UseAppUpdaterOptions = {}) {
     }
     if (disposed) return;
     hourlyTimer = setInterval(() => {
-      if (!retryTimer) {
+      if (!retryTimer && autoUpdateEnabled.value) {
         retries = 0;
         void checkUpdates({ silent: true });
       }
     }, 3_600_000);
-    void checkUpdates({ silent: true });
+    if (autoUpdateEnabled.value) void checkUpdates({ silent: true });
   }
   const stopSettingsWatch = watch(autoUpdateEnabled, (enabled) => {
     if (disposed) return;
