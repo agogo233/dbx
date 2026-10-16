@@ -73,12 +73,11 @@ jobs:
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      - name: Build frontend
-        run: pnpm build
-
-      - name: Build DBX for Windows x64
+      - name: Build DBX portable (Windows x64)
         shell: pwsh
-        run: cargo build --locked --package dbx --release --target x86_64-pc-windows-msvc
+        # tauri build runs beforeBuildCommand (pnpm build) then embeds the
+        # frontend into the binary, matching the upstream release path.
+        run: pnpm tauri build --no-bundle --target x86_64-pc-windows-msvc -- --locked
 
       - name: Package portable ZIP
         shell: pwsh
@@ -87,11 +86,20 @@ jobs:
           $arch = "x64"
           $portableDir = "DBX-${version}-${arch}"
           $zipName = "DBX-${version}-${arch}-portable.zip"
-          $exePath = "target/x86_64-pc-windows-msvc/release/dbx.exe"
+          $exePath = @(
+            "target/x86_64-pc-windows-msvc/release/dbx.exe",
+            "src-tauri/target/x86_64-pc-windows-msvc/release/dbx.exe"
+          ) | Where-Object { Test-Path $_ } | Select-Object -First 1
 
-          if (!(Test-Path $exePath)) {
-            throw "Missing Windows executable: $exePath"
+          if (!$exePath) {
+            throw "dbx.exe not found in expected target dirs"
           }
+
+          $exeSize = (Get-Item $exePath).Length
+          if ($exeSize -lt 10MB) {
+            throw "dbx.exe ($exeSize bytes) too small - frontend likely not embedded"
+          }
+          Write-Host "dbx.exe size: $exeSize bytes (frontend embedded OK)"
 
           New-Item -ItemType Directory -Force -Path $portableDir | Out-Null
           Copy-Item $exePath (Join-Path $portableDir "DBX.exe") -Force
