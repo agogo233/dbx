@@ -100,6 +100,17 @@ export interface AiConfigItem extends AiConfig {
   isDefault?: boolean;
 }
 
+export interface CcSwitchImportSkipped {
+  appType: string;
+  name: string;
+  reason: string;
+}
+
+export interface CcSwitchImportResult {
+  configs: AiConfigItem[];
+  skipped: CcSwitchImportSkipped[];
+}
+
 export interface AiActiveModelSelection {
   configId: string;
   modelId: string;
@@ -116,6 +127,8 @@ export interface AiChatSelectionState {
   active?: AiActiveModelSelection;
   effortPreferences: AiModelEffortPreference[];
   defaultMode?: AiAssistantMode;
+  /** Whether new AI conversations start with the action picker on `auto` (#9118). */
+  defaultAutoRouting?: boolean;
   /** Whether opening the AI panel restores the most recently updated conversation. */
   restoreLastConversation?: boolean;
   /** Prompt template ids auto-applied when the AI panel opens, keyed by connection db_type. */

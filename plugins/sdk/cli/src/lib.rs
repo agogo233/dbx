@@ -1045,6 +1045,7 @@ fn reject_unknown_manifest_fields(manifest: &Value) -> Result<(), String> {
         "engines",
         "permissions",
         "entrypoints",
+        "capabilities",
         "contributions",
         "localizations",
     ];
@@ -1122,10 +1123,45 @@ fn build_rust_backend(
     }
     command.env("CARGO_TARGET_DIR", target_directory);
     run_command(&mut command, "Rust backend build")?;
-    let built = target_directory.join("release").join(executable_name(&backend.binary));
+    let built = rust_backend_binary_path(target_directory, &backend.binary, cargo_build_target().as_deref())?;
     fs::copy(&built, staged_executable)
         .map_err(|error| format!("Failed to copy Rust backend {}: {error}", built.display()))?;
     Ok(())
+}
+
+/// Read the cross-build target cargo was told to use, if any. `cargo build
+/// --release` writes into `<target-dir>/<triple>/release` when this is set (for
+/// example a musl triple for fully static Linux sidecars) instead of
+/// `<target-dir>/release`.
+fn cargo_build_target() -> Option<String> {
+    let value = std::env::var("CARGO_BUILD_TARGET").ok()?;
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed.contains(['/', '\\']) || trimmed.contains("..") {
+        return None;
+    }
+    Some(trimmed.to_string())
+}
+
+/// Locate the release binary cargo produced for the plugin backend. Cargo
+/// changes the output layout when a build target is configured, so the
+/// triple-qualified path is checked first and the plain host layout is kept as
+/// a fallback for older cargo behaviour and for prebuilt directories.
+fn rust_backend_binary_path(
+    target_directory: &Path,
+    binary: &str,
+    build_target: Option<&str>,
+) -> Result<PathBuf, String> {
+    let executable = executable_name(binary);
+    let mut candidates = Vec::new();
+    if let Some(triple) = build_target {
+        candidates.push(target_directory.join(triple).join("release").join(&executable));
+    }
+    candidates.push(target_directory.join("release").join(executable));
+    if let Some(found) = candidates.iter().find(|candidate| candidate.is_file()) {
+        return Ok(found.clone());
+    }
+    let searched = candidates.iter().map(|path| path.display().to_string()).collect::<Vec<_>>().join(", ");
+    Err(format!("Failed to locate the Rust backend binary after build; looked in {searched}"))
 }
 
 fn build_go_backend(
@@ -1139,26 +1175,39 @@ fn build_go_backend(
         return Err(format!("Go backend is missing {}/go.mod", backend_directory.display()));
     }
     let mut command = Command::new("go");
-    command.current_dir(&backend_directory).arg("build").arg("-trimpath").arg("-o").arg(staged_executable).arg(".");
+    command.current_dir(&backend_directory).arg("build").arg("-trimpath");
     if let Some(sdk_root) = sdk_root_from_environment()? {
         let sdk = sdk_root.join("plugins/sdk/go/dbx-plugin-sdk");
         if !sdk.join("go.mod").is_file() {
             return Err(format!("Go plugin SDK was not found at {}", sdk.display()));
         }
         fs::create_dir_all(build_directory).map_err(|error| error.to_string())?;
-        let work_file = build_directory.join("go.work");
-        fs::write(
-            &work_file,
-            format!(
-                "go 1.22\n\nuse (\n\t{}\n\t{}\n)\n",
-                serde_json::to_string(&backend_directory.to_string_lossy()).map_err(|error| error.to_string())?,
-                serde_json::to_string(&sdk.to_string_lossy()).map_err(|error| error.to_string())?
-            ),
-        )
-        .map_err(|error| error.to_string())?;
-        command.env("GOWORK", work_file);
+        let mod_file = build_directory.join("go.mod");
+        fs::copy(backend_directory.join("go.mod"), &mod_file).map_err(|error| error.to_string())?;
+        let source_sum = backend_directory.join("go.sum");
+        if source_sum.is_file() {
+            fs::copy(source_sum, build_directory.join("go.sum")).map_err(|error| error.to_string())?;
+        }
+        let mut replace = Command::new("go");
+        replace
+            .current_dir(&backend_directory)
+            .arg("mod")
+            .arg("edit")
+            .arg("-modfile")
+            .arg(&mod_file)
+            .arg(format!(
+                "-replace=github.com/t8y2/dbx/plugins/sdk/go/dbx-plugin-sdk={}",
+                go_work_path(&sdk)
+            ));
+        run_command(&mut replace, "Go module setup")?;
+        command.env("GOWORK", "off").arg("-modfile").arg(&mod_file);
     }
+    command.arg("-o").arg(staged_executable).arg(".");
     run_command(&mut command, "Go backend build")
+}
+
+fn go_work_path(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
 }
 
 fn run_command(command: &mut Command, label: &str) -> Result<(), String> {
@@ -1219,6 +1268,18 @@ fn template_values(
         ("PUBLISHER", options.publisher.clone()),
         ("PUBLISHER_JSON", json_string_content(&options.publisher)),
         ("VERSION", options.version.clone()),
+        ("CLI_VERSION", CLI_VERSION.to_string()),
+        ("GO_VERSION", if options.template == ProjectTemplate::Go { "1.22.x" } else { "" }.to_string()),
+        ("RUST_TOOLCHAIN", if options.template == ProjectTemplate::Rust { "stable" } else { "" }.to_string()),
+        (
+            "PACKAGE_COMMAND",
+            if options.template == ProjectTemplate::Svelte {
+                "npm ci && npm run build && dbx-plugin package ."
+            } else {
+                "dbx-plugin package ."
+            }
+            .to_string(),
+        ),
         ("TEMPLATE", options.template.as_str().to_string()),
         ("TEMPLATE_LABEL", options.template.label().to_string()),
         ("LANGUAGE", backend_language.map(BackendLanguage::as_str).unwrap_or("none").to_string()),
@@ -1565,13 +1626,47 @@ fn keygen_usage() -> String {
 #[cfg(test)]
 mod tests {
     use std::io::Cursor;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     use super::{
-        color_enabled_with, create_project, generate_signing_key_file, package_manifest, package_project,
-        resolve_create_options, run_cli, styled, title_from_slug, validate_manifest_assets, validate_semver,
-        BackendConfig, CreateInputs, CreateOptions, PackageOptions, ProjectTemplate, ANSI_ACCENT,
+        color_enabled_with, create_project, executable_name, generate_signing_key_file, package_manifest,
+        package_project, resolve_create_options, run_cli, rust_backend_binary_path, styled, title_from_slug,
+        validate_manifest_assets, validate_semver, BackendConfig, CreateInputs, CreateOptions, PackageOptions,
+        ProjectTemplate, ANSI_ACCENT, CLI_VERSION,
     };
+
+    #[test]
+    fn rust_backend_binary_path_prefers_cross_build_target_layout() {
+        let root = tempfile::tempdir().unwrap();
+        let triple_directory = root.path().join("x86_64-unknown-linux-musl").join("release");
+        std::fs::create_dir_all(&triple_directory).unwrap();
+        let binary = triple_directory.join(executable_name("dbx-market-watch"));
+        std::fs::write(&binary, b"binary").unwrap();
+
+        let found =
+            rust_backend_binary_path(root.path(), "dbx-market-watch", Some("x86_64-unknown-linux-musl")).unwrap();
+        assert_eq!(found, binary);
+    }
+
+    #[test]
+    fn rust_backend_binary_path_falls_back_to_host_release_layout() {
+        let root = tempfile::tempdir().unwrap();
+        let release_directory = root.path().join("release");
+        std::fs::create_dir_all(&release_directory).unwrap();
+        let binary = release_directory.join(executable_name("dbx-demo"));
+        std::fs::write(&binary, b"binary").unwrap();
+
+        assert_eq!(rust_backend_binary_path(root.path(), "dbx-demo", Some("aarch64-apple-darwin")).unwrap(), binary);
+        assert_eq!(rust_backend_binary_path(root.path(), "dbx-demo", None).unwrap(), binary);
+    }
+
+    #[test]
+    fn rust_backend_binary_path_reports_every_searched_location() {
+        let root = tempfile::tempdir().unwrap();
+        let error = rust_backend_binary_path(root.path(), "dbx-demo", Some("x86_64-unknown-linux-musl")).unwrap_err();
+        assert!(error.contains("x86_64-unknown-linux-musl"), "{error}");
+        assert!(error.contains("release"), "{error}");
+    }
 
     #[test]
     fn rejects_development_data_in_package_inputs() {
@@ -1582,6 +1677,11 @@ mod tests {
         let output = root.path().join("stage");
         assert!(super::copy_path(&input, &output).unwrap_err().contains(".dbx-dev"));
         assert!(!output.join(".dbx-dev/connections.json").exists());
+    }
+
+    #[test]
+    fn normalizes_go_work_paths_for_windows() {
+        assert_eq!(super::go_work_path(Path::new(r"C:\workspace\backend")), "C:/workspace/backend");
     }
 
     #[test]
@@ -1825,7 +1925,13 @@ mod tests {
             let workflow = std::fs::read_to_string(directory.join(".github/workflows/plugin-release.yml")).unwrap();
             assert!(!workflow.contains("signing-key-id"));
             assert!(!workflow.contains("DBX_PLUGIN_SIGNING_KEY"));
-            assert!(workflow.contains("plugin-cli-version: 0.1.3"));
+            assert!(workflow.contains(&format!("plugin-cli-version: {CLI_VERSION}")));
+            assert!(workflow.contains(&format!("plugin-release-reusable.yml@plugin-cli-v{CLI_VERSION}")));
+            assert!(!workflow.contains("@plugin-sdk-v1"));
+            let go_version = if template == ProjectTemplate::Go { "1.22.x" } else { "" };
+            let rust_toolchain = if template == ProjectTemplate::Rust { "stable" } else { "" };
+            assert!(workflow.contains(&format!("go-version: \"{go_version}\"")));
+            assert!(workflow.contains(&format!("rust-toolchain: \"{rust_toolchain}\"")));
             assert!(!workflow.contains("sdk-ref:"));
 
             match template {
@@ -1836,6 +1942,7 @@ mod tests {
                     assert!(workflow.contains("\"target\":\"universal\""));
                 }
                 ProjectTemplate::Svelte => {
+                    assert!(workflow.contains("package-command: npm ci && npm run build && dbx-plugin package ."));
                     assert!(manifest["entrypoints"].get("backend").is_none());
                     assert!(config.get("backend").is_none());
                     assert!(directory.join("src/App.svelte").is_file());
