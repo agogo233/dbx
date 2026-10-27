@@ -186,12 +186,14 @@ mod tests {
             objects: None,
             mode: TransferMode::Overwrite,
             target_table_name_case: TransferTableNameCase::Preserve,
+            target_column_name_case: TransferColumnNameCase::Preserve,
             quote_target_column_names: true,
             ownership_policy: TransferOwnershipPolicy::Preserve,
             batch_size: 1000,
             table_filters: HashMap::new(),
             drop_target_before_create: false,
             drop_target_confirmed: false,
+            oracle_packages: None,
         }
     }
 

@@ -33,6 +33,9 @@ fn send_transfer_progress(channel: &TransferProgressChannel, progress: &transfer
 
 fn terminal_transfer_error(req: &TransferRequest, error: impl ToString) -> transfer::TransferProgress {
     transfer::TransferProgress {
+        oracle_package_approval: None,
+        oracle_package_preflight: None,
+        oracle_routine_operation: None,
         transfer_id: req.transfer_id.clone(),
         table: String::new(),
         table_index: 0,
@@ -320,7 +323,8 @@ mod tests {
     };
     use dbx_core::persistence::task_history::{TaskRunItemsQuery, TaskRunStatus, TransferObjectSelectionMode};
     use dbx_core::transfer::{
-        TransferContent, TransferMode, TransferOwnershipPolicy, TransferRequest, TransferTableNameCase,
+        TransferColumnNameCase, TransferContent, TransferMode, TransferOwnershipPolicy, TransferRequest,
+        TransferTableNameCase,
     };
 
     fn sqlite_config(id: &str, path: &str) -> ConnectionConfig {
@@ -424,10 +428,12 @@ mod tests {
             create_table: false,
             drop_target_before_create: false,
             drop_target_confirmed: false,
+            oracle_packages: None,
             content: TransferContent::DataOnly,
             objects: Some(Vec::new()),
             mode: TransferMode::Append,
             target_table_name_case: TransferTableNameCase::Preserve,
+            target_column_name_case: TransferColumnNameCase::Preserve,
             quote_target_column_names: true,
             ownership_policy: TransferOwnershipPolicy::Preserve,
             batch_size: 1000,

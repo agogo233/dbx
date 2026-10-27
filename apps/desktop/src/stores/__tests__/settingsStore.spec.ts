@@ -27,10 +27,43 @@ import {
   COMPACT_TAB_TITLE_DEFAULT_VERSION,
 } from "@/stores/settingsStore";
 import type { AiConfigItem } from "@/types/ai";
-import { DATA_GRID_EXTRACTOR_OPTIONS_MIGRATION_VERSION } from "@/lib/dataGrid/dataGridCopyExtractor";
+import { DATA_GRID_DEFAULT_VISIBLE_COPY_EXTRACTORS, DATA_GRID_EXTRACTOR_OPTIONS_MIGRATION_VERSION } from "@/lib/dataGrid/dataGridCopyExtractor";
+import { editorSettingsDraftChanged, editorSettingsDraftFromSettings, editorSettingsPatchFromDraft } from "@/lib/settings/editorSettingsDraft";
 import { DEFAULT_MONO_FONT_FAMILY } from "@/lib/app/appFonts";
 
 describe("normalizeEditorSettings", () => {
+  it("defaults query connection group paths to hidden and validates the toggle", () => {
+    expect(DEFAULT_EDITOR_SETTINGS.showConnectionGroupPath).toBe(false);
+    expect(normalizeEditorSettings({}).showConnectionGroupPath).toBe(false);
+    expect(normalizeEditorSettings({ showConnectionGroupPath: true }).showConnectionGroupPath).toBe(true);
+    expect(normalizeEditorSettings({ showConnectionGroupPath: "true" as any }).showConnectionGroupPath).toBe(false);
+  });
+
+  it("migrates legacy partial DDL settings before applying and tracking the patch", async () => {
+    setActivePinia(createPinia());
+    const { useSettingsStore } = await import("@/stores/settingsStore");
+    const settings = useSettingsStore();
+    settings.updateEditorSettings({ excludeDdlStorage: false } as any);
+    expect(settings.editorSettings.includeDdlStorage).toBe(true);
+    settings.updateEditorSettings({ includeDdlStorage: false, excludeDdlStorage: false } as any);
+    expect(settings.editorSettings.includeDdlStorage).toBe(false);
+    expect(settings.editorSettings).not.toHaveProperty("excludeDdlStorage");
+  });
+
+  it("migrates DDL storage choices to positive settings without retaining the legacy key", () => {
+    const defaults = normalizeEditorSettings({});
+    expect(defaults).toMatchObject({ includeDdlStorage: false, compactDdlSql: true, separateDdlIndexes: false });
+    for (const excludeDdlStorage of [true, false]) {
+      const migrated = normalizeEditorSettings({ excludeDdlStorage } as any);
+      expect(migrated.includeDdlStorage).toBe(!excludeDdlStorage);
+      expect(migrated).not.toHaveProperty("excludeDdlStorage");
+      expect(normalizeEditorSettings(JSON.parse(JSON.stringify(migrated))).includeDdlStorage).toBe(!excludeDdlStorage);
+    }
+    expect(normalizeEditorSettings({ includeDdlStorage: true, excludeDdlStorage: true } as any).includeDdlStorage).toBe(true);
+    expect(normalizeEditorSettings({ includeDdlStorage: false, excludeDdlStorage: false } as any).includeDdlStorage).toBe(false);
+    expect(normalizeEditorSettings({ compactDdlSql: false, separateDdlIndexes: true })).toMatchObject({ compactDdlSql: false, separateDdlIndexes: true });
+  });
+
   it("preserves the compact object browser view and rejects unknown modes", () => {
     expect(normalizeEditorSettings({ objectBrowserViewMode: "compact" }).objectBrowserViewMode).toBe("compact");
     expect(normalizeEditorSettings({ objectBrowserViewMode: "unknown" as any }).objectBrowserViewMode).toBe(DEFAULT_EDITOR_SETTINGS.objectBrowserViewMode);
@@ -460,6 +493,13 @@ describe("normalizeEditorSettings", () => {
     expect(normalizeEditorSettings({ functionCompletionIncludeParams: "yes" as unknown as boolean }).functionCompletionIncludeParams).toBe(true);
   });
 
+  it("enables sequence completion by default and preserves an explicit opt-out", () => {
+    expect(DEFAULT_EDITOR_SETTINGS.sequenceCompletionEnabled).toBe(true);
+    expect(normalizeEditorSettings({}).sequenceCompletionEnabled).toBe(true);
+    expect(normalizeEditorSettings({ sequenceCompletionEnabled: false }).sequenceCompletionEnabled).toBe(false);
+    expect(normalizeEditorSettings({ sequenceCompletionEnabled: "yes" as unknown as boolean }).sequenceCompletionEnabled).toBe(true);
+  });
+
   it("defaults snippetTriggerKey to tab and preserves valid options while falling back on invalid values", () => {
     expect(normalizeEditorSettings({}).snippetTriggerKey).toBe("tab");
     expect(normalizeEditorSettings({ snippetTriggerKey: "tab" }).snippetTriggerKey).toBe("tab");
@@ -583,6 +623,19 @@ describe("normalizeEditorSettings", () => {
     expect(normalizeEditorSettings({ deleteConnectionTabHandlingMode: "keep-all" } as any).deleteConnectionTabHandlingMode).toBe("keep-all-tabs");
   });
 
+  it("defaults DeepLink confirmation to always and maps the legacy boolean switch", () => {
+    // 默认都要确认：深链打开连接仍然要用户在弹窗里确认一次。
+    expect(normalizeEditorSettings({}).deepLinkConnectionConfirmMode).toBe("always");
+    for (const mode of ["always", "create", "update", "all"] as const) {
+      expect(normalizeEditorSettings({ deepLinkConnectionConfirmMode: mode }).deepLinkConnectionConfirmMode).toBe(mode);
+    }
+    // 上一版的布尔开关只覆盖新建连接，true 收敛成 create。
+    expect(normalizeEditorSettings({ deepLinkConnectionAutoCreate: true } as any).deepLinkConnectionConfirmMode).toBe("create");
+    expect(normalizeEditorSettings({ deepLinkConnectionAutoCreate: false } as any).deepLinkConnectionConfirmMode).toBe("always");
+    // 非法值一律回落默认值。
+    expect(normalizeEditorSettings({ deepLinkConnectionConfirmMode: "sometimes" } as any).deepLinkConnectionConfirmMode).toBe("always");
+  });
+
   it("remembers connection databases by default and sanitizes the stored map", () => {
     expect(normalizeEditorSettings({}).rememberConnectionDatabaseOnDelete).toBe(true);
     expect(normalizeEditorSettings({ rememberConnectionDatabaseOnDelete: false }).rememberConnectionDatabaseOnDelete).toBe(false);
@@ -655,6 +708,8 @@ describe("normalizeEditorSettings", () => {
       quote: '"',
       quotePolicy: "minimal",
     });
+    expect(defaults.valueFormat).toBe("default");
+    expect(normalizeEditorSettings({}).dataGridVisibleCopyExtractors).toEqual(DATA_GRID_DEFAULT_VISIBLE_COPY_EXTRACTORS);
     expect(defaults.sql).toMatchObject({
       skipComputedColumns: true,
       skipGeneratedColumns: true,
@@ -672,6 +727,9 @@ describe("normalizeEditorSettings", () => {
     expect(configured.dsv.quotePolicy).toBe("always");
     expect(configured.sql.insertMode).toBe("row-by-row");
     expect(configured.json.pretty).toBe(false);
+    const visible = normalizeEditorSettings({ dataGridVisibleCopyExtractors: ["php", "php", "unknown"] }).dataGridVisibleCopyExtractors;
+    expect(visible).toEqual(["php"]);
+    expect(normalizeEditorSettings({ dataGridVisibleCopyExtractors: [] }).dataGridVisibleCopyExtractors).toEqual([]);
   });
 
   it("migrates the legacy NULL clipboard sentinel once", () => {
@@ -692,21 +750,27 @@ describe("normalizeEditorSettings", () => {
     expect(configured.dataGridExtractorOptions.dsv.nullText).toBe("NULL");
   });
 
-  it("resets the copy extractor database-name opt-in once when migrating to v2", () => {
+  it("restores the copy extractor database-name opt-in default when migrating to v3 (#12146)", () => {
     const legacy = normalizeEditorSettings({
-      dataGridExtractorOptionsMigrationVersion: 1,
-      dataGridExtractorOptions: { sql: { includeDatabaseName: true } },
+      dataGridExtractorOptionsMigrationVersion: 2,
+      dataGridExtractorOptions: { sql: { includeDatabaseName: false } },
     });
-    // 历史持久化的「包含数据库名称」归位到新默认：复制/导出 SQL 默认不带库名/模式名
-    expect(legacy.dataGridExtractorOptions.sql.includeDatabaseName).toBe(false);
+    // v2 中被重置为 false 的历史配置重新恢复为新默认：复制/导出 SQL 默认带库名/模式名
+    expect(legacy.dataGridExtractorOptions.sql.includeDatabaseName).toBe(true);
     expect(legacy.dataGridExtractorOptionsMigrationVersion).toBe(DATA_GRID_EXTRACTOR_OPTIONS_MIGRATION_VERSION);
 
-    const current = normalizeEditorSettings({
+    const currentExplicitFalse = normalizeEditorSettings({
+      dataGridExtractorOptionsMigrationVersion: DATA_GRID_EXTRACTOR_OPTIONS_MIGRATION_VERSION,
+      dataGridExtractorOptions: { sql: { includeDatabaseName: false } },
+    });
+    // v3 迁移之后用户的显式取消勾选必须被保留
+    expect(currentExplicitFalse.dataGridExtractorOptions.sql.includeDatabaseName).toBe(false);
+
+    const currentExplicitTrue = normalizeEditorSettings({
       dataGridExtractorOptionsMigrationVersion: DATA_GRID_EXTRACTOR_OPTIONS_MIGRATION_VERSION,
       dataGridExtractorOptions: { sql: { includeDatabaseName: true } },
     });
-    // 迁移之后用户的显式勾选必须被保留
-    expect(current.dataGridExtractorOptions.sql.includeDatabaseName).toBe(true);
+    expect(currentExplicitTrue.dataGridExtractorOptions.sql.includeDatabaseName).toBe(true);
   });
 
   it("defaults retained result runs to tiled tabs and preserves list mode", () => {
@@ -1179,6 +1243,24 @@ describe("normalizeEditorSettings - tabLayout", () => {
   });
 });
 
+describe("normalizeEditorSettings - colorizeConnectionTabsScope", () => {
+  it("defaults colorizeConnectionTabsScope to all", () => {
+    expect(normalizeEditorSettings({}).colorizeConnectionTabsScope).toBe("all");
+  });
+
+  it("preserves explicit all and active modes", () => {
+    expect(normalizeEditorSettings({ colorizeConnectionTabsScope: "all" }).colorizeConnectionTabsScope).toBe("all");
+    expect(normalizeEditorSettings({ colorizeConnectionTabsScope: "active" }).colorizeConnectionTabsScope).toBe("active");
+  });
+
+  it("falls back to all for invalid values", () => {
+    expect(normalizeEditorSettings({ colorizeConnectionTabsScope: "invalid" } as any).colorizeConnectionTabsScope).toBe("all");
+    expect(normalizeEditorSettings({ colorizeConnectionTabsScope: undefined } as any).colorizeConnectionTabsScope).toBe("all");
+    expect(normalizeEditorSettings({ colorizeConnectionTabsScope: null } as any).colorizeConnectionTabsScope).toBe("all");
+    expect(normalizeEditorSettings({ colorizeConnectionTabsScope: 123 } as any).colorizeConnectionTabsScope).toBe("all");
+  });
+});
+
 describe("normalizeEditorSettings - tabMaxWidth", () => {
   it("defaults tabMaxWidth to 0", () => {
     expect(normalizeEditorSettings({}).tabMaxWidth).toBe(0);
@@ -1214,6 +1296,87 @@ describe("normalizeEditorSettings - sidebarPinDefaultDatabase", () => {
     expect(normalizeEditorSettings({ sidebarPinDefaultDatabase: undefined } as any).sidebarPinDefaultDatabase).toBe(true);
     expect(normalizeEditorSettings({ sidebarPinDefaultDatabase: null } as any).sidebarPinDefaultDatabase).toBe(true);
     expect(normalizeEditorSettings({ sidebarPinDefaultDatabase: 0 } as any).sidebarPinDefaultDatabase).toBe(true);
+  });
+});
+
+// #13302 implemented this as an opt-in switch with a default-off build, but the
+// old auto-expand behavior was the long-standing default and the off default was
+// taken as a regression. The default is enabled again (migration v1); users with
+// many schemas can still opt out with the switch.
+describe("normalizeEditorSettings - sidebarExpandTreeOnConnect", () => {
+  it("defaults sidebarExpandTreeOnConnect to true", () => {
+    expect(normalizeEditorSettings({}).sidebarExpandTreeOnConnect).toBe(true);
+  });
+
+  it("honors an explicit toggle stamped with the current default version", () => {
+    expect(normalizeEditorSettings({ sidebarExpandTreeOnConnect: true, sidebarExpandTreeOnConnectMigrationVersion: 1 }).sidebarExpandTreeOnConnect).toBe(true);
+    expect(normalizeEditorSettings({ sidebarExpandTreeOnConnect: false, sidebarExpandTreeOnConnectMigrationVersion: 1 }).sidebarExpandTreeOnConnect).toBe(false);
+  });
+
+  it("migrates legacy blobs without the marker to the enabled default", () => {
+    expect(normalizeEditorSettings({ sidebarExpandTreeOnConnect: false }).sidebarExpandTreeOnConnect).toBe(true);
+    expect(normalizeEditorSettings({ sidebarExpandTreeOnConnect: true }).sidebarExpandTreeOnConnect).toBe(true);
+    expect(normalizeEditorSettings({ sidebarExpandTreeOnConnect: "false" } as any).sidebarExpandTreeOnConnect).toBe(true);
+  });
+
+  it("falls back to default for non-boolean values", () => {
+    expect(normalizeEditorSettings({ sidebarExpandTreeOnConnect: "true" } as any).sidebarExpandTreeOnConnect).toBe(true);
+    expect(normalizeEditorSettings({ sidebarExpandTreeOnConnect: undefined } as any).sidebarExpandTreeOnConnect).toBe(true);
+    expect(normalizeEditorSettings({ sidebarExpandTreeOnConnect: 1 } as any).sidebarExpandTreeOnConnect).toBe(true);
+  });
+});
+
+// #13549: the toggle was registered on the interface, the defaults, the normalize
+// whitelist and the settings-dialog draft, but never on the patch applier. Every
+// apply dropped the key, so the store value never changed, the dialog compared its
+// draft against a base that never moved, and "apply and close" kept reporting
+// unsaved changes.
+describe("updateEditorSettings - sidebarExpandTreeOnConnect", () => {
+  beforeEach(() => {
+    vi.resetModules();
+    setActivePinia(createPinia());
+  });
+
+  it("applies and persists the sidebarExpandTreeOnConnect toggle", async () => {
+    const loadEditorSettings = vi.fn().mockResolvedValue({});
+    const saveEditorSettings = vi.fn().mockResolvedValue(undefined);
+    vi.doMock("@/lib/backend/api", () => ({ loadEditorSettings, saveEditorSettings }));
+
+    const { useSettingsStore } = await import("@/stores/settingsStore");
+    const store = useSettingsStore();
+    await store.initEditorSettings();
+    saveEditorSettings.mockClear();
+
+    store.updateEditorSettings({ sidebarExpandTreeOnConnect: true });
+    expect(store.editorSettings.sidebarExpandTreeOnConnect).toBe(true);
+    await vi.waitFor(() => expect(saveEditorSettings).toHaveBeenCalledOnce());
+    expect(saveEditorSettings).toHaveBeenLastCalledWith(expect.objectContaining({ sidebarExpandTreeOnConnect: true }));
+
+    store.updateEditorSettings({ sidebarExpandTreeOnConnect: false });
+    expect(store.editorSettings.sidebarExpandTreeOnConnect).toBe(false);
+  });
+
+  it("clears the settings-dialog dirty state once the toggle is applied", async () => {
+    const loadEditorSettings = vi.fn().mockResolvedValue({});
+    const saveEditorSettings = vi.fn().mockResolvedValue(undefined);
+    vi.doMock("@/lib/backend/api", () => ({ loadEditorSettings, saveEditorSettings }));
+
+    const { useSettingsStore } = await import("@/stores/settingsStore");
+    const store = useSettingsStore();
+    await store.initEditorSettings();
+
+    // The dialog compares its draft against a base snapshot that is rebuilt from the
+    // store after every apply. A key that never reaches the store keeps the two apart
+    // forever, which is what made the dialog report unsaved changes and refuse to close.
+    const base = editorSettingsDraftFromSettings(store.editorSettings);
+    const draft = { ...base, sidebarExpandTreeOnConnect: false };
+    expect(editorSettingsDraftChanged(draft, base)).toBe(true);
+
+    store.updateEditorSettings(editorSettingsPatchFromDraft(draft, base));
+
+    const appliedBase = editorSettingsDraftFromSettings(store.editorSettings);
+    expect(appliedBase.sidebarExpandTreeOnConnect).toBe(false);
+    expect(editorSettingsDraftChanged(draft, appliedBase)).toBe(false);
   });
 });
 
@@ -1473,6 +1636,13 @@ describe("settingsStore AI API key normalization", () => {
       requiresApiKey: false,
     });
     expect(AI_PROVIDER_PRESETS).not.toHaveProperty(CC_SWITCH_PROVIDER_ID);
+  });
+
+  it("defaults new MiniMax configurations to Flash and preserves explicit models", () => {
+    expect(normalizeAiConfig({ provider: "minimax" }).model).toBe("MiniMax-M3.1-Flash");
+    for (const model of ["MiniMax-M3", "MiniMax-M2.7", "private-model", ""]) {
+      expect(normalizeAiConfig({ provider: "minimax", model }).model).toBe(model);
+    }
   });
 
   it("preserves saved MiniMax endpoints during normalization", () => {
@@ -1871,8 +2041,10 @@ describe("settingsStore persisted settings initialization", () => {
     const firstStore = useSettingsStore();
     await firstStore.initEditorSettings();
     expect(firstStore.editorSettings.colorizeConnectionTabs).toBe(true);
+    expect(firstStore.editorSettings.colorizeConnectionTabsScope).toBe("all");
     await firstStore.updateEditorSettingsAndPersist({
       colorizeConnectionTabs: false,
+      colorizeConnectionTabsScope: "active",
       tabPlacement: "left",
       tabGroupMode: "connection",
       tabSortMode: "title-asc",
@@ -1887,6 +2059,7 @@ describe("settingsStore persisted settings initialization", () => {
 
     expect(restartedStore.editorSettings).toMatchObject({
       colorizeConnectionTabs: false,
+      colorizeConnectionTabsScope: "active",
       tabPlacement: "left",
       tabGroupMode: "connection",
       tabSortMode: "title-asc",
@@ -2860,5 +3033,33 @@ describe("settingsStore defaultAiMode lifecycle", () => {
     store.setDefaultAutoRouting(true);
 
     await vi.waitFor(() => expect(saveAiChatSelection).toHaveBeenLastCalledWith(expect.objectContaining({ defaultAutoRouting: true })));
+  });
+
+  it("restores and persists the include/exclude query result preference (#12757)", async () => {
+    const saveAiChatSelection = vi.fn().mockResolvedValue(undefined);
+    vi.doMock("@/lib/backend/api", () => ({
+      loadAiConfigs: vi.fn().mockResolvedValue([]),
+      loadAiConfig: vi.fn().mockResolvedValue(null),
+      loadAiProviderConfigs: vi.fn().mockResolvedValue(null),
+      loadAiChatSelection: vi.fn().mockResolvedValue({ version: 1, effortPreferences: [], includeQueryResult: true }),
+      saveAiChatSelection,
+    }));
+
+    const { useSettingsStore } = await import("@/stores/settingsStore");
+    const store = useSettingsStore();
+    await store.initAiConfigs();
+
+    expect(store.includeQueryResult).toBe(true);
+    expect(store.excludeQueryResult).toBe(false);
+
+    store.setIncludeQueryResult(false);
+    expect(store.includeQueryResult).toBe(false);
+    expect(store.excludeQueryResult).toBe(true);
+
+    store.setExcludeQueryResult(false);
+    expect(store.includeQueryResult).toBe(true);
+    expect(store.excludeQueryResult).toBe(false);
+
+    await vi.waitFor(() => expect(saveAiChatSelection).toHaveBeenLastCalledWith(expect.objectContaining({ includeQueryResult: true })));
   });
 });

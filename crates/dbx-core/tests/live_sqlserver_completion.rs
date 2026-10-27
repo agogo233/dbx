@@ -113,6 +113,7 @@ fn live_sqlserver_import_mapping(source: &str, target: &str) -> TableImportColum
         source_column: source.to_string(),
         target_column: target.to_string(),
         target_data_type: None,
+        generator: None,
     }
 }
 
@@ -1327,6 +1328,7 @@ async fn live_sqlserver_sql_file_import_executes_go_batches() {
         part_cooldown_ms: 0,
         skip_relational_constraints: false,
         failure_log_enabled: true,
+        resolve_includes: false,
         encoding: Default::default(),
     };
     let done_seen = AtomicBool::new(false);
@@ -1421,10 +1423,12 @@ async fn live_sqlserver_transfer_table_skips_rowversion_insert_column() {
         create_table: true,
         drop_target_before_create: false,
         drop_target_confirmed: false,
+        oracle_packages: None,
         content: dbx_core::transfer::TransferContent::default(),
         objects: Some(Vec::new()),
         mode: dbx_core::transfer::TransferMode::Append,
         target_table_name_case: dbx_core::transfer::TransferTableNameCase::Upper,
+        target_column_name_case: dbx_core::transfer::TransferColumnNameCase::Preserve,
         quote_target_column_names: true,
         ownership_policy: dbx_core::transfer::TransferOwnershipPolicy::Preserve,
         batch_size: 100,
