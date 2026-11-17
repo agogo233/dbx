@@ -4,7 +4,6 @@ import type { CSSProperties } from "vue";
 import { useI18n } from "vue-i18n";
 import {
   ArrowDownAZ,
-  ArrowDownWideNarrow,
   ArrowRightLeft,
   ArrowUpAZ,
   ArrowUpDown,
@@ -15,12 +14,13 @@ import {
   Clock,
   Database,
   Download,
-  FilePlus,
+  FilePlus2,
   FileText,
   FolderCog,
   FolderClosed,
   FolderOpen,
   FolderPlus,
+  GripVertical,
   Layers,
   Library,
   Loader2,
@@ -33,6 +33,7 @@ import {
 } from "@lucide/vue";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+import { DropdownMenu, DropdownMenuContent, DropdownMenuRadioGroup, DropdownMenuRadioItem, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
 import { useSqlPanelSearchMode } from "@/composables/useSqlPanelSearchMode";
 import SidebarLocateButton from "@/components/sidebar/SidebarLocateButton.vue";
 import SqlPanelSearch from "@/components/layout/SqlPanelSearch.vue";
@@ -58,9 +59,10 @@ import { savedSqlFolderBranchFileCount } from "@/lib/savedSql/savedSqlFolderCoun
 import { collectSavedSqlDirectoryImportFiles } from "@/lib/savedSql/savedSqlDirectoryImport";
 import { savedSqlBatchErrorMessage, savedSqlErrorMessage } from "@/lib/savedSql/savedSqlErrors";
 import { savedSqlDatabaseScopeKey } from "@/lib/savedSql/savedSqlDatabaseTree";
+import { getSavedSqlExpandedFolderIds, saveSavedSqlExpandedFolderIds } from "@/lib/savedSql/savedSqlUiState";
 import { ensureSqlExtension, extractCandidateDatabaseFromName, nextAvailableSqlName } from "@/lib/savedSql/savedSqlFileName";
 import { savedSqlImportTarget } from "@/lib/savedSql/savedSqlImportTarget";
-import { buildSavedSqlTreeRows, savedSqlFolderBranchMatches, type SavedSqlTreeRow } from "@/lib/savedSql/savedSqlTreeRows";
+import { buildSavedSqlTreeRows, savedSqlFolderBranchMatches, type SavedSqlTreeRow, type SavedSqlTreeSortMode } from "@/lib/savedSql/savedSqlTreeRows";
 import { savedSqlExecutionTargetFromTab, type SavedSqlOpenTargetMode } from "@/lib/savedSql/savedSqlExecutionTarget";
 import { uniqueSavedSqlExportFileName, exportSavedSqlFileContent } from "@/lib/savedSql/savedSqlExport";
 import { orderedListRangeAnchorIndex, orderedListSelectionIntent } from "@/lib/selection/orderedListSelection";
@@ -78,8 +80,13 @@ const queryStore = useQueryStore();
 const settingsStore = useSettingsStore();
 const { databaseOptions, loadingDatabaseOptions, loadDatabaseOptions, catalogOptions, loadingCatalogOptions, loadCatalogOptions, catalogDatabaseOptions, loadingCatalogDatabaseOptions, loadCatalogDatabaseOptions } = useDatabaseOptions();
 
+const props = defineProps<{
+  locateRequest?: { id: number; fileId: string } | null;
+}>();
+
 const emit = defineEmits<{
   close: [];
+  "locate-handled": [id: number];
 }>();
 
 const UNFILED_DROP_TARGET_ID = "__sql-library-unfiled__";
@@ -117,13 +124,28 @@ watch(
   },
 );
 
-// Sort mode: "folder" (manual sibling order) or "date" (updated date among siblings)
-const sortMode = ref<"folder" | "date">("folder");
+const sortMode = ref<SavedSqlTreeSortMode>("folder");
+const sortMenuOpen = ref(false);
+const sortOptions = computed(
+  () =>
+    [
+      { mode: "folder", label: t("sqlFileTree.sortManual"), icon: GripVertical },
+      { mode: "name-asc", label: t("sqlLibrary.sortNameAsc"), icon: ArrowDownAZ },
+      { mode: "name-desc", label: t("sqlLibrary.sortNameDesc"), icon: ArrowUpAZ },
+      { mode: "created", label: t("sqlLibrary.sortByDateCreated"), icon: Calendar },
+      { mode: "date", label: t("sqlLibrary.sortByDate"), icon: Clock },
+    ] as const,
+);
+const currentSortOption = computed(() => sortOptions.value.find((option) => option.mode === sortMode.value)!);
 
 function getConnectionLabel(connectionId: string) {
   if (!connectionId) return t("sqlLibrary.unassociated");
   const conn = connectionStore.connections.find((c) => c.id === connectionId);
   return conn?.name || t("sqlLibrary.deletedConnection");
+}
+
+function connectionIconColor(connectionId: string) {
+  return connectionStore.getConfig(connectionId)?.color || undefined;
 }
 
 function folderPath(folder: SavedSqlFolder) {
@@ -159,7 +181,7 @@ async function exportSingleFile(file: SavedSqlFile) {
   try {
     const loadedFile = await savedSqlStore.ensureFileContent(file.id);
     if (!loadedFile) return;
-    const result = await exportSavedSqlFileContent(loadedFile.sql, file.name);
+    const result = await exportSavedSqlFileContent(loadedFile.sql, loadedFile.name);
     if (result === "saved") toast(t("sqlLibrary.exported"), 2000);
   } catch (e: any) {
     toast(t("sqlLibrary.exportFailed", { message: e?.message || String(e) }), 5000);
@@ -425,29 +447,30 @@ const treeRows = computed<SavedSqlTreeRow[]>(() =>
 
 const hasAnyVisibleItem = computed(() => treeRows.value.length > 0);
 
-const collapsedFolders = ref<Set<string>>(new Set());
+const expandedFolders = ref<Set<string>>(getSavedSqlExpandedFolderIds());
 
-// Seed a default-collapsed state when the library first becomes non-empty so
-// opening the panel shows every directory collapsed instead of fully expanded.
-// Guarded so a later in-session folder add/delete does not re-collapse folders
-// the user has already expanded.
-const collapseDefaultsSeeded = ref(false);
+function saveExpandedFoldersState() {
+  saveSavedSqlExpandedFolderIds(expandedFolders.value);
+}
+
+// Prune deleted folder IDs when folder list is loaded or modified.
 watch(
   () => savedSqlStore.allFolders.map((folder) => folder.id),
   (folderIds) => {
-    if (collapseDefaultsSeeded.value || folderIds.length === 0) return;
-    collapseDefaultsSeeded.value = true;
-    collapsedFolders.value = new Set(folderIds);
+    if (folderIds.length === 0 || expandedFolders.value.size === 0) return;
+    const validIds = new Set(folderIds);
+    const pruned = new Set([...expandedFolders.value].filter((id) => validIds.has(id)));
+    if (pruned.size !== expandedFolders.value.size) {
+      expandedFolders.value = pruned;
+      saveExpandedFoldersState();
+    }
   },
-  { immediate: true },
 );
 
 function collapseAllFolders() {
-  // Collapse the whole tree: every folder currently known, including nested
-  // children, is marked collapsed in one shot.
-  const folderIds = savedSqlStore.allFoldersTreeOrder.map((folder) => folder.id);
-  if (folderIds.length === 0) return;
-  collapsedFolders.value = new Set(folderIds);
+  if (expandedFolders.value.size === 0) return;
+  expandedFolders.value = new Set();
+  saveExpandedFoldersState();
 }
 
 function hasAnyFolder(): boolean {
@@ -463,16 +486,17 @@ function toggleFolder(folderId: string) {
     const folder = savedSqlStore.allFolders.find((candidate) => candidate.id === folderId);
     if (folder && folderBranchMatchesQuery(folder)) return;
   }
-  const next = new Set(collapsedFolders.value);
+  const next = new Set(expandedFolders.value);
   if (next.has(folderId)) next.delete(folderId);
   else next.add(folderId);
-  collapsedFolders.value = next;
+  expandedFolders.value = next;
+  saveExpandedFoldersState();
 }
 
 function isFolderExpanded(folder: SavedSqlFolder) {
   // 搜索激活时,命中的分支自动展开以便直接看到匹配文件;否则遵循折叠状态。
   if (searchQuery.value && folderBranchMatchesQuery(folder)) return true;
-  return !collapsedFolders.value.has(folder.id);
+  return expandedFolders.value.has(folder.id);
 }
 
 async function openNewFolderInput(parentFolderId?: string) {
@@ -481,7 +505,8 @@ async function openNewFolderInput(parentFolderId?: string) {
   const connectionId = parent?.connectionId || connectionStore.connections[0]?.id;
   if (!connectionId) return;
   if (parent?.id) {
-    collapsedFolders.value = new Set([...collapsedFolders.value].filter((id) => id !== parent.id));
+    expandedFolders.value = new Set([...expandedFolders.value, parent.id]);
+    saveExpandedFoldersState();
   }
   try {
     const folder = await savedSqlStore.createFolder(connectionId, t("savedSql.newFolderDefault"), parent?.id);
@@ -496,7 +521,8 @@ async function openNewQueryInFolder(folder?: SavedSqlFolder) {
   const connectionId = folder?.connectionId || connectionStore.activeConnectionId || connectionStore.connections[0]?.id;
   if (!connectionId) return;
   if (folder?.id) {
-    collapsedFolders.value = new Set([...collapsedFolders.value].filter((id) => id !== folder.id));
+    expandedFolders.value = new Set([...expandedFolders.value, folder.id]);
+    saveExpandedFoldersState();
   }
 
   const folderFiles = folder ? savedSqlStore.filesInFolder(folder.id) : [];
@@ -541,21 +567,22 @@ const activeSavedSqlId = computed(() => queryStore.tabs.find((tab) => tab.id ===
 const libraryTree = ref<HTMLElement | null>(null);
 const currentSavedSqlFile = computed(() => (activeSavedSqlId.value ? savedSqlStore.getFile(activeSavedSqlId.value) : undefined));
 
-async function locateCurrentFile() {
-  const file = currentSavedSqlFile.value;
+async function locateFile(fileId: string) {
+  const file = savedSqlStore.getFile(fileId);
   if (!file) return;
   if (searchInputPending.value || !treeRows.value.some((row) => row.type === "file" && row.file.id === file.id)) {
     searchInput.value?.clear();
   }
-  const expanded = new Set(collapsedFolders.value);
+  const expanded = new Set(expandedFolders.value);
   const visited = new Set<string>();
   let folderId = file.folderId;
   while (folderId && !visited.has(folderId)) {
     visited.add(folderId);
-    expanded.delete(folderId);
+    expanded.add(folderId);
     folderId = savedSqlStore.allFolders.find((folder) => folder.id === folderId)?.parentFolderId;
   }
-  collapsedFolders.value = expanded;
+  expandedFolders.value = expanded;
+  saveExpandedFoldersState();
   clearSelection();
   activeItemId.value = file.id;
   activeItemType.value = "file";
@@ -564,6 +591,25 @@ async function locateCurrentFile() {
   const row = Array.from(libraryTree.value?.querySelectorAll<HTMLElement>("[data-sql-library-file]") ?? []).find((element) => element.dataset.sqlLibraryFile === file.id);
   row?.scrollIntoView({ block: "center", inline: "nearest" });
 }
+
+async function locateCurrentFile() {
+  const file = currentSavedSqlFile.value;
+  if (!file) return;
+  await locateFile(file.id);
+}
+
+watch(
+  [() => savedSqlStore.loadState, () => props.locateRequest],
+  async ([loadState, request]) => {
+    if (!request || loadState === "loading") return;
+    try {
+      await locateFile(request.fileId);
+    } finally {
+      emit("locate-handled", request.id);
+    }
+  },
+  { immediate: true, flush: "post" },
+);
 
 const hasCurrentSavedSqlExecutionTarget = computed(() => {
   const activeTab = queryStore.tabs.find((tab) => tab.id === queryStore.activeTabId);
@@ -1242,7 +1288,7 @@ const contextMenuItems = computed<CtxMenuItem[]>(() => {
     const hasSortOptions = unfiledFiles.length > 1 || rootFolders.length > 1 || savedSqlStore.allFiles.length > 1;
     return [
       { label: t("savedSql.newFolder"), action: openNewFolderInput, icon: FolderPlus },
-      { label: t("savedSql.newQuery"), action: () => openNewQueryInFolder(), icon: FilePlus },
+      { label: t("savedSql.newQuery"), action: () => openNewQueryInFolder(), icon: FilePlus2 },
       {
         label: t("savedSql.pasteFile"),
         action: () => pasteLibraryFiles("panel"),
@@ -1333,7 +1379,7 @@ const contextMenuItems = computed<CtxMenuItem[]>(() => {
   const directFolders = childFolders(target.id);
   return [
     { label: t("savedSql.newSubfolder"), action: () => openNewFolderInput(target.id), icon: FolderPlus },
-    { label: t("savedSql.newQuery"), action: () => openNewQueryInFolder(target), icon: FilePlus },
+    { label: t("savedSql.newQuery"), action: () => openNewQueryInFolder(target), icon: FilePlus2 },
     {
       label: t("savedSql.pasteFile"),
       action: () => pasteLibraryFiles(target),
@@ -1501,6 +1547,7 @@ async function performDrop() {
   const targetType = dragState.targetType;
   const dropPosition = dragState.dropPosition;
   if (!draggedId || !draggedType || !targetId || !targetType || !dropPosition) return;
+  if (sortMode.value !== "folder" && dropPosition !== "inside") return;
 
   if (draggedType === "folder" && targetType === "folder" && dropPosition !== "inside") {
     await savedSqlStore.reorderFolders(draggedId, targetId, dropPosition);
@@ -1584,6 +1631,7 @@ function updateDropTarget(event: MouseEvent, targetId: string, targetType: DragI
     nextPosition = "inside";
   }
 
+  if (sortMode.value !== "folder" && nextPosition !== "inside") nextPosition = null;
   dragState.targetId = nextPosition ? targetId : null;
   dragState.targetType = nextPosition ? targetType : null;
   dragState.dropPosition = nextPosition;
@@ -1611,6 +1659,12 @@ function showDropAfter(targetId: string) {
 function showDropInside(targetId: string) {
   return dragState.active && dragState.targetId === targetId && dragState.dropPosition === "inside";
 }
+
+defineExpose({
+  locateFile,
+  locateCurrentFile,
+  searchInput,
+});
 </script>
 
 <template>
@@ -1627,11 +1681,23 @@ function showDropInside(targetId: string) {
           <ChevronsDownUp class="h-3 w-3" />
         </Button>
       </LightTooltip>
-      <LightTooltip :text="sortMode === 'folder' ? t('sqlLibrary.sortByDate') : t('sqlLibrary.sortByFolder')" side="bottom" :delay="0" :close-delay="0" nowrap>
-        <Button variant="ghost" size="icon" class="h-5 w-5" @click="sortMode = sortMode === 'folder' ? 'date' : 'folder'">
-          <ArrowDownWideNarrow :class="['h-3 w-3', sortMode === 'date' ? 'text-primary' : '']" />
-        </Button>
-      </LightTooltip>
+      <DropdownMenu v-model:open="sortMenuOpen">
+        <LightTooltip :text="currentSortOption.label" side="bottom" :delay="0" :close-delay="0" nowrap :disabled="sortMenuOpen">
+          <DropdownMenuTrigger as-child>
+            <Button data-sql-library-sort-btn variant="ghost" size="icon" class="h-5 w-5" :aria-label="currentSortOption.label">
+              <component :is="currentSortOption.icon" class="h-3 w-3" :class="{ 'text-primary': sortMode !== 'folder' }" />
+            </Button>
+          </DropdownMenuTrigger>
+        </LightTooltip>
+        <DropdownMenuContent align="end" class="w-max max-w-[calc(100vw-16px)]">
+          <DropdownMenuRadioGroup :model-value="sortMode" @update:model-value="sortMode = $event as SavedSqlTreeSortMode">
+            <DropdownMenuRadioItem v-for="option in sortOptions" :key="option.mode" :value="option.mode">
+              <component :is="option.icon" class="h-3.5 w-3.5" />
+              {{ option.label }}
+            </DropdownMenuRadioItem>
+          </DropdownMenuRadioGroup>
+        </DropdownMenuContent>
+      </DropdownMenu>
       <LightTooltip :text="t('sqlFileTree.locateActiveFile')" side="bottom" :delay="0" :close-delay="0" nowrap>
         <SidebarLocateButton class="disabled:pointer-events-none disabled:opacity-50" :label="t('sqlFileTree.locateActiveFile')" :disabled="!currentSavedSqlFile" @locate="locateCurrentFile" />
       </LightTooltip>
@@ -1692,6 +1758,7 @@ function showDropInside(targetId: string) {
               <div
                 v-if="row.type === 'folder'"
                 class="relative flex cursor-default items-center gap-1 py-1.5 pr-2 text-[13px] group"
+                :data-sql-library-folder="row.folder.id"
                 :style="{ paddingLeft: `${8 + row.depth * 16}px` }"
                 :class="[showDropInside(row.folder.id) ? 'ring-1 ring-primary/50 bg-primary/5' : folderRowClass(row.folder.id), isDraggingItem(row.folder.id) ? 'opacity-50' : '']"
                 @mousedown="handleDragMouseDown($event, row.folder.id, 'folder')"
@@ -1706,7 +1773,7 @@ function showDropInside(targetId: string) {
               >
                 <div v-if="showDropBefore(row.folder.id)" class="absolute left-2 right-2 top-0 border-t-2 border-primary" />
                 <div v-if="showDropAfter(row.folder.id)" class="absolute left-2 right-2 bottom-0 border-b-2 border-primary" />
-                <component :is="isFolderExpanded(row.folder) ? FolderOpen : FolderClosed" class="h-4 w-4 text-amber-500 shrink-0" />
+                <component :is="isFolderExpanded(row.folder) ? FolderOpen : FolderClosed" class="h-4 w-4 text-amber-500 shrink-0" :style="{ color: connectionIconColor(row.folder.connectionId) }" />
                 <template v-if="isRenamingFolder(row.folder.id)">
                   <input
                     :ref="setRenameInputRef"
@@ -1758,7 +1825,7 @@ function showDropInside(targetId: string) {
                 >
                   <div v-if="showDropBefore(row.file.id)" class="absolute left-2 right-2 top-0 border-t-2 border-primary" />
                   <div v-if="showDropAfter(row.file.id)" class="absolute left-2 right-2 bottom-0 border-b-2 border-primary" />
-                  <FileText class="h-3.5 w-3.5 text-blue-400 shrink-0" />
+                  <FileText class="h-3.5 w-3.5 text-blue-400 shrink-0" :style="{ color: connectionIconColor(row.file.connectionId) }" />
                   <span v-if="isFileDirty(row.file)" aria-hidden="true" class="dirty-sql-library-marker">*</span>
                   <template v-if="isRenamingFile(row.file.id)">
                     <input

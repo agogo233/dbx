@@ -1,11 +1,11 @@
-import { requiresDamengIdentifierQuote, requiresMysqlIdentifierQuote, requiresOracleIdentifierQuote, requiresPostgresIdentifierQuote } from "@/lib/sql/sqlIdentifier";
+import { requiresClickhouseIdentifierQuote, requiresDamengIdentifierQuote, requiresMysqlIdentifierQuote, requiresOracleIdentifierQuote, requiresPostgresIdentifierQuote } from "@/lib/sql/sqlIdentifier";
 import { tokenIsIdentifier, tokenizeSqlSemantic, unquoteSqlSemanticIdentifier } from "@/lib/sql/semantic/tokens";
 import type { SqlSemanticToken } from "@/lib/sql/semantic/types";
 import { formatSqlForDisplay, sqlFormatDialectForDbType, type SqlFormatDialect } from "@/lib/sql/sqlFormatter";
 import { DEFAULT_SQL_FORMATTER_SETTINGS, type SqlFormatterSettings } from "@/lib/sql/sqlFormatterConfig";
 import { applyDdlStoragePreference } from "@/lib/sql/ddlStorage";
 import { compactDdlSql } from "@/lib/sql/ddlCompact";
-import { formatStarRocksDdlForDisplay } from "@/lib/sql/starrocksDdlDisplay";
+import { formatStarRocksDdlForDisplay, formatStarRocksViewForDisplay } from "@/lib/sql/starrocksDdlDisplay";
 import { dropsSchemaQualifier, quoteTableIdentifier } from "@/lib/table/tableSelectSql";
 import type { DatabaseType } from "@/types/database";
 
@@ -31,8 +31,9 @@ type DdlColumnAttributePositions = {
 function canRenderUnquoted(identifier: string, dialect: SqlFormatDialect): boolean {
   switch (dialect) {
     case "mysql":
-    case "clickhouse":
       return !requiresMysqlIdentifierQuote(identifier);
+    case "clickhouse":
+      return !requiresClickhouseIdentifierQuote(identifier);
     case "postgres":
     case "sqlite":
     case "duckdb":
@@ -586,5 +587,6 @@ export function applyDdlDisplayPreferences(sql: string, options: DdlDisplayForma
  * result of the object DDL fetch straight through it.
  */
 export async function formatDdlForDisplay(ddl: string, options: DdlDisplayFormatOptions, formatter: Partial<SqlFormatterSettings> = DEFAULT_SQL_FORMATTER_SETTINGS): Promise<string> {
-  return applyDdlDisplayPreferences(options.databaseType === "starrocks" ? ddl : await formatSqlForDisplay(ddl, options.dialect, formatter), options);
+  const formatted = options.databaseType === "starrocks" ? await formatStarRocksViewForDisplay(ddl, formatter) : await formatSqlForDisplay(ddl, options.dialect, formatter);
+  return applyDdlDisplayPreferences(formatted, options);
 }

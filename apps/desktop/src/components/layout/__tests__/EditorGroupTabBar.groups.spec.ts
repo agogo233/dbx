@@ -62,6 +62,9 @@ function mountBar(groupId: string, tabs: ReturnType<ReturnType<typeof useQuerySt
       messages: {
         en: {
           contextMenu: {
+            splitTab: "Split",
+            batchCloseTabs: "Close multiple tabs",
+            copyTabName: "Copy tab name",
             renameTab: "Rename",
             duplicateTab: "Duplicate",
             copyName: "Copy name",
@@ -338,7 +341,7 @@ describe("EditorGroupTabBar group behavior", () => {
     settings.editorSettings.tabGroupMode = "connection";
     const pgA = store.createTab("pg-1", "app", "PG 1", "query");
     store.createTab("pg-1", "app", "PG 2", "query");
-    const my = store.createTab("mysql-1", "app", "MY 1", "query");
+    store.createTab("mysql-1", "app", "MY 1", "query");
     const mainGroup = store.groups[0];
     const { app, host } = mountBar(mainGroup.id, store.tabs.slice(), pgA, pinia);
     await settle();
@@ -510,7 +513,7 @@ describe("EditorGroupTabBar group behavior", () => {
     settings.editorSettings.tabGroupMode = "database";
     const pgApp = store.createTab("pg-1", "app", "PG app", "query");
     store.createTab("mysql-1", "app", "MY app", "query");
-    const pgConn = store.createTab("pg-1", "", "PG conn", "query");
+    store.createTab("pg-1", "", "PG conn", "query");
     const mainGroup = store.groups[0];
     const { app, host } = mountBar(mainGroup.id, store.tabs.slice(), pgApp, pinia);
     await settle();
@@ -695,16 +698,50 @@ describe("EditorGroupTabBar group behavior", () => {
       expect(host.querySelector(".tab-group-header img[src$='/pulsar.svg']")).toBeNull();
       expect(host.querySelector(`[data-tab-id="${queryTabId}"]`)).not.toBeNull();
       expect(host.querySelector(`[data-tab-id="${pluginTabId}"]`)).toBeNull();
+      expect(host.querySelector(".tab-overflow-control")).not.toBeNull();
 
       pluginHeader.click();
       await settle();
       expect(host.querySelector(`[data-tab-id="${pluginTabId}"]`)).not.toBeNull();
       expect(host.querySelector(`[data-tab-id="${queryTabId}"]`)).toBeNull();
+      expect(host.querySelector(".tab-overflow-control")).not.toBeNull();
 
       queryHeader.click();
       await settle();
       expect(host.querySelector(`[data-tab-id="${queryTabId}"]`)).not.toBeNull();
       expect(host.querySelector(`[data-tab-id="${pluginTabId}"]`)).toBeNull();
+      expect(host.querySelector(".tab-overflow-control")).not.toBeNull();
+    } finally {
+      app.unmount();
+      host.remove();
+    }
+  });
+
+  it("keeps the tab overflow control available for every multi-tab group in two-row mode", async () => {
+    const store = useQueryStore();
+    const settings = useSettingsStore();
+    settings.editorSettings.tabGroupMode = "connection";
+    settings.editorSettings.tabGroupRows = "two-row";
+    settings.editorSettings.tabPlacement = "top";
+    const mysqlTabId = store.createTab("mysql-1", "app", "MySQL 1", "query");
+    store.createTab("mysql-1", "app", "MySQL 2", "query");
+    store.createTab("mongo-1", "app", "Mongo 1", "query");
+    store.createTab("mongo-1", "app", "Mongo 2", "query");
+    const { app, host, activeTab } = mountBar(store.groups[0]!.id, store.tabs.slice(), mysqlTabId, pinia, {
+      "onActivate-tab": (tabId: string) => {
+        activeTab.id = tabId;
+      },
+    });
+
+    try {
+      await settle();
+      expect(host.querySelector(".tab-overflow-control")).not.toBeNull();
+
+      const mongoHeader = Array.from(host.querySelectorAll<HTMLButtonElement>(".tab-group-rail-scroll .tab-group-header")).find((header) => header.title === "mongo-1");
+      expect(mongoHeader).not.toBeUndefined();
+      mongoHeader!.click();
+      await settle();
+      expect(host.querySelector(".tab-overflow-control")).not.toBeNull();
     } finally {
       app.unmount();
       host.remove();
@@ -852,6 +889,64 @@ describe("EditorGroupTabBar group behavior", () => {
     host.remove();
   });
 
+  it.each([
+    { groupMode: "connection", menuTarget: "tab" },
+    { groupMode: "connection", menuTarget: "header" },
+    { groupMode: "sidebar", menuTarget: "tab" },
+    { groupMode: "sidebar", menuTarget: "header" },
+  ] as const)("preserves other $groupMode groups when closing the active group from its $menuTarget", async ({ groupMode, menuTarget }) => {
+    const store = useQueryStore();
+    const settings = useSettingsStore();
+    settings.editorSettings.tabGroupMode = groupMode;
+    settings.editorSettings.tabPlacement = "left";
+    const survivor = store.createTab("mysql-1", "app", "Survivor", "query");
+    store.createTab("oracle-1", "audit", "Expanded", "query");
+    const closing = store.createTab("pg-1", "reports", "Closing", "query");
+    const { app, host } = mountBar(store.focusedGroupId, store.tabs, closing, pinia, {
+      get tabs() {
+        return store.tabs;
+      },
+      get activeTabId() {
+        return store.activeTabId;
+      },
+    });
+    try {
+      await settle();
+      const survivorHeader = Array.from(host.querySelectorAll<HTMLButtonElement>(".tab-group-header")).find((header) => header.title === "mysql-1")!;
+      survivorHeader.click();
+      await settle();
+      expect(survivorHeader.getAttribute("aria-expanded")).toBe("false");
+      const states = Array.from(host.querySelectorAll<HTMLButtonElement>(".tab-group-header"), (header) => [header.title, header.getAttribute("aria-expanded")]);
+      const target = menuTarget === "tab" ? host.querySelector<HTMLElement>(`[data-tab-id="${closing}"]`)! : Array.from(host.querySelectorAll<HTMLButtonElement>(".tab-group-header")).find((header) => header.title === "pg-1")!;
+      target.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true, clientX: 10, clientY: 10 }));
+      await settle();
+      // Current main nests tab batch actions in a submenu; the original base
+      // exposes them directly. Exercise the actual menu in either layout.
+      const batchClose = Array.from(document.body.querySelectorAll<HTMLButtonElement>("[data-dbx-context-menu] button")).find((button) => button.textContent?.includes("Close multiple tabs"));
+      if (batchClose) {
+        batchClose.click();
+        await settle();
+      }
+      const closeGroup = Array.from(document.body.querySelectorAll<HTMLButtonElement>("[data-dbx-context-menu] button")).find((button) => button.textContent?.includes("Close group"));
+      expect(closeGroup).toBeDefined();
+      closeGroup!.click();
+      await settle();
+      expect(store.tabs.map((tab) => tab.id)).not.toContain(closing);
+      expect(store.activeTabId).toBe(survivor);
+      for (const header of host.querySelectorAll<HTMLButtonElement>(".tab-group-header")) {
+        expect([header.title, header.getAttribute("aria-expanded")]).toEqual(states.find(([title]) => title === header.title));
+      }
+      store.activateTab(store.tabs.find((tab) => tab.id !== survivor)!.id);
+      await settle();
+      store.activateTab(survivor);
+      await settle();
+      expect(survivorHeader.getAttribute("aria-expanded")).toBe("true");
+    } finally {
+      app.unmount();
+      host.remove();
+    }
+  });
+
   it("closing a group stays within the invoking pane, sparing the same-key cluster elsewhere", async () => {
     const store = useQueryStore();
     const settings = useSettingsStore();
@@ -876,7 +971,11 @@ describe("EditorGroupTabBar group behavior", () => {
 
     const menu = document.body.querySelector<HTMLElement>("[data-dbx-context-menu]")!;
     expect(menu).not.toBeNull();
-    const closeGroupItem = Array.from(menu.querySelectorAll<HTMLButtonElement>("button")).find((button) => button.textContent?.includes("Close group"));
+    Array.from(menu.querySelectorAll<HTMLButtonElement>("button"))
+      .find((button) => button.textContent?.includes("Close multiple tabs"))!
+      .click();
+    await settle();
+    const closeGroupItem = Array.from(document.querySelectorAll<HTMLButtonElement>("[data-dbx-context-menu] button")).find((button) => button.textContent?.includes("Close group"));
     expect(closeGroupItem).toBeDefined();
     closeGroupItem!.click();
     await settle();
@@ -908,7 +1007,11 @@ describe("EditorGroupTabBar group behavior", () => {
     pgPill.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true, clientX: 10, clientY: 10 }));
     await settle();
     const menu = document.body.querySelector<HTMLElement>("[data-dbx-context-menu]")!;
-    const closeGroupItem = Array.from(menu.querySelectorAll<HTMLButtonElement>("button")).find((button) => button.textContent?.includes("Close group"));
+    Array.from(menu.querySelectorAll<HTMLButtonElement>("button"))
+      .find((button) => button.textContent?.includes("Close multiple tabs"))!
+      .click();
+    await settle();
+    const closeGroupItem = Array.from(document.querySelectorAll<HTMLButtonElement>("[data-dbx-context-menu] button")).find((button) => button.textContent?.includes("Close group"));
     expect(closeGroupItem).toBeDefined();
     closeGroupItem!.click();
     await settle();

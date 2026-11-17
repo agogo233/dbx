@@ -55,7 +55,10 @@ pub use admin::mq;
 #[cfg(feature = "mq-admin")]
 pub use admin::mqtt;
 pub use admin::nacos;
+pub use ai::mcp_access;
+pub use ai::mcp_catalog;
 pub use ai::mcp_policy;
+pub use ai::plugin_mcp;
 pub use ai::prompt_template;
 pub use connection::driver_runtime;
 pub use connection::jdbc;
@@ -122,6 +125,7 @@ pub use dbx_sql::sql_error_position;
 pub use dbx_sql::sql_parser;
 pub use dbx_sql::sql_risk;
 pub(crate) use dbx_sql::sqlserver_temporal;
+pub use dbx_sql::tdengine_export_sql;
 pub use dbx_types::types;
 pub use host::update;
 pub use persistence::state_persistence;

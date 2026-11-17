@@ -49,6 +49,7 @@ import {
   Maximize2,
   Minimize2,
   Package,
+  FilePlus2,
   PanelBottom,
   PanelLeft,
   PanelRight,
@@ -56,7 +57,6 @@ import {
   Pencil,
   Pin,
   PlugZap,
-  Plus,
   RotateCcw,
   RotateCw,
   Rows2,
@@ -145,6 +145,7 @@ const emit = defineEmits<{
   "activate-tab": [tabId: string];
   "locate-tab": [tab: QueryTab];
   "locate-sql-file": [tab: QueryTab];
+  "locate-sql-library-file": [tab: QueryTab];
   "toggle-zen-mode": [];
   "start-resize": [event: PointerEvent];
   "toggle-collapse": [];
@@ -382,14 +383,19 @@ function revealActiveTabAfterLayout() {
 
 const showOverflowControl = computed(() => {
   void tabLayoutRevision.value;
+  // In two-row mode the detail strip represents a selected semantic group.
+  // Keep its tab-list affordance available for every rendered group, including
+  // single-tab plugin pages, instead of deriving it from physical overflow.
+  if (isTwoRowLayout.value) return twoRowSelectedTabCount.value > 0;
+
   // A single-row strip hides tabs in two ways: they scroll out of the viewport
   // (real overflow) or they stay in it and ellipsize their labels, which the
   // scroll box cannot see because a capped pill narrows itself instead of
-  // overflowing (useTabTitleTruncation). The two-row layout decides from its
+  // overflowing (useTabTitleTruncation). The fixed-row layout decides from its
   // rows' scroll extents alone: its first row narrows itself by the arrow's
   // reserved width (.tab-section-frame--with-overflow-control), so feeding
-  // clipping back into the arrow there would rebuild the loop that the constant
-  // reservation exists to break.
+  // clipping back into the arrow there would rebuild the loop that the
+  // constant reservation exists to break.
   const hasHiddenTab = hasHorizontalFixedRows.value ? fixedTabsScroll.hasTabOverflow.value || regularTabsScroll.hasTabOverflow.value || hasHorizontalRowOverflow() : hasTabOverflow.value || hasTruncatedTabTitle.value;
   return props.tabs.length > 0 && hasHiddenTab && !isWrapLayout.value && !isVerticalLayout.value;
 });
@@ -1239,6 +1245,7 @@ const twoRowSelectedKey = computed<string | null>(() => {
   if (twoRowFocusedGroupKey.value !== null && items.some((item) => item.key === twoRowFocusedGroupKey.value)) return twoRowFocusedGroupKey.value;
   return items[0]!.key;
 });
+const twoRowSelectedTabCount = computed(() => twoRowGroupItems.value.find((group) => group.key === twoRowSelectedKey.value)?.count ?? 0);
 
 type SpecialPageSurface = "pluginCenter" | "settings" | "driverStore";
 
@@ -1438,7 +1445,7 @@ function removeTabDragGhost() {
 }
 
 function isDirtyTab(tab: QueryTab) {
-  return queryStore.isTabDirty(tab);
+  return queryStore.dirtyTabIds.has(tab.id);
 }
 
 function tabTitleStyle(tab: QueryTab): CSSProperties | undefined {
@@ -1658,11 +1665,6 @@ function handleSaveAllTabs() {
 
 function getTabMenuItems(tab: QueryTab): ContextMenuItem[] {
   const items: ContextMenuItem[] = [
-    {
-      label: compactTabTitle.value ? t("contextMenu.fullTabTitle") : t("contextMenu.compactTabTitle"),
-      action: toggleCompactTabTitle,
-      icon: compactTabTitle.value ? Maximize2 : Minimize2,
-    },
     ...createRenameDuplicateTabItems({
       tab,
       t,
@@ -1677,7 +1679,7 @@ function getTabMenuItems(tab: QueryTab): ContextMenuItem[] {
       visible: canSetTabSuffix(tab),
     },
     {
-      label: t("contextMenu.copyName"),
+      label: t("contextMenu.copyTabName"),
       action: async () => {
         try {
           await copyToClipboard(tabTitleText(tab));
@@ -1694,6 +1696,112 @@ function getTabMenuItems(tab: QueryTab): ContextMenuItem[] {
       icon: Maximize2,
       visible: !!props.canDetachTabs && isDetachableTab(tab),
     },
+    // Split actions stay visible but render disabled when they cannot produce
+    // a new layout — at the four-group cap, or with a single open tab (the
+    // store rejects with the same rules). Every tab type can split: groups
+    // host non-query tabs via ContentArea, same as moving them between groups.
+    {
+      label: t("contextMenu.splitTab"),
+      icon: ArrowRight,
+      children: [
+        {
+          label: t("contextMenu.splitRight"),
+          action: () => queryStore.splitTabRight(tab.id),
+          disabled: splitUnavailable.value,
+          icon: ArrowRight,
+        },
+        {
+          label: t("contextMenu.splitDown"),
+          action: () => queryStore.splitTabDown(tab.id),
+          disabled: splitUnavailable.value,
+          icon: ArrowDown,
+        },
+        ...(canChangeOrientation.value
+          ? [
+              {
+                label: t("contextMenu.changeOrientation"),
+                action: () => queryStore.setOrientation(queryStore.orientation === "vertical" ? "horizontal" : "vertical"),
+                icon: RotateCw,
+              },
+            ]
+          : []),
+        ...(isSecondaryGroup.value
+          ? [
+              {
+                label: t("contextMenu.unsplit"),
+                action: () => queryStore.unsplitTab(tab.id),
+                icon: ArrowRight,
+                visible: true,
+              },
+            ]
+          : []),
+      ],
+    },
+    { label: "", separator: true },
+    createPinTabMenuItem({
+      label: tab.pinned ? t("contextMenu.unpinTab") : t("contextMenu.pinTab"),
+      onToggle: () => queryStore.togglePinnedTab(tab.id),
+    }),
+    createSaveAllTabsMenuItem({
+      label: t("contextMenu.saveAllTabs"),
+      disabled: !queryStore.hasDirtyTabs,
+      shortcut: formatShortcut(settingsStore.editorSettings.shortcuts?.saveAllTabs ?? ""),
+      onSaveAll: () => handleSaveAllTabs(),
+    }),
+    createReopenClosedTabMenuItem({
+      label: t("contextMenu.reopenClosedTab"),
+      disabled: !queryStore.canReopenClosedTab,
+      shortcut: formatShortcut(settingsStore.editorSettings.shortcuts?.reopenClosedTab ?? "Shift+Mod+T"),
+      onReopen: () => queryStore.reopenClosedTab(),
+    }),
+    createCloseTabMenuItem({
+      label: t("contextMenu.closeTab"),
+      onClose: () => closeTab(tab),
+    }),
+    {
+      label: t("contextMenu.batchCloseTabs"),
+      icon: X,
+      children: [
+        createCloseOtherTabMenuItem({
+          label: t("contextMenu.closeOtherTabs"),
+          onClose: () => queryStore.closeOtherTabsInGroup(props.groupId, tab.id),
+        }),
+        createCloseLeftTabMenuItem({
+          label: t("contextMenu.closeLeftTabs"),
+          disabled: !hasTabsToLeft(tab),
+          onClose: () => {
+            const tabsToClose = tabsToLeftInDisplayOrder(tab).map((item) => item.id);
+            const finalActiveTabId = queryStore.activeTabId && !tabsToClose.includes(queryStore.activeTabId) ? queryStore.activeTabId : tab.id;
+            queryStore.closeTabsByIds(tabsToClose, finalActiveTabId);
+          },
+        }),
+        createCloseRightTabMenuItem({
+          label: t("contextMenu.closeRightTabs"),
+          disabled: !hasTabsToRight(tab),
+          onClose: () => {
+            const tabsToClose = tabsToRightInDisplayOrder(tab).map((item) => item.id);
+            const finalActiveTabId = queryStore.activeTabId && !tabsToClose.includes(queryStore.activeTabId) ? queryStore.activeTabId : tab.id;
+            queryStore.closeTabsByIds(tabsToClose, finalActiveTabId);
+          },
+        }),
+        createCloseAllTabMenuItem({
+          label: t("contextMenu.closeAllTabs"),
+          onClose: () => queryStore.closeAllTabsInGroup(props.groupId, tab.id),
+        }),
+        {
+          label: t("contextMenu.closeTabGroup"),
+          action: () => closeTabGroup(tab),
+          visible: settingsStore.editorSettings.tabGroupMode !== "none",
+          icon: X,
+        },
+      ],
+    },
+    { label: "", separator: true },
+    {
+      label: compactTabTitle.value ? t("contextMenu.fullTabTitle") : t("contextMenu.compactTabTitle"),
+      action: toggleCompactTabTitle,
+      icon: compactTabTitle.value ? Maximize2 : Minimize2,
+    },
     createLocateTabMenuItem({
       t,
       visible: !!activeTabSidebarTarget(tab),
@@ -1705,94 +1813,12 @@ function getTabMenuItems(tab: QueryTab): ContextMenuItem[] {
       visible: !!queryTabExternalFilePath(tab),
       action: () => emit("locate-sql-file", tab),
     },
-    { label: "", separator: true },
-    createPinTabMenuItem({
-      label: tab.pinned ? t("contextMenu.unpinTab") : t("contextMenu.pinTab"),
-      onToggle: () => queryStore.togglePinnedTab(tab.id),
-    }),
-    // Split actions stay visible but render disabled when they cannot produce
-    // a new layout — at the four-group cap, or with a single open tab (the
-    // store rejects with the same rules). Every tab type can split: groups
-    // host non-query tabs via ContentArea, same as moving them between groups.
     {
-      label: t("contextMenu.splitRight"),
-      action: () => queryStore.splitTabRight(tab.id),
-      disabled: splitUnavailable.value,
-      icon: ArrowRight,
+      label: t("sqlFileTree.locateActiveFile"),
+      icon: Crosshair,
+      visible: !!tab.savedSqlId,
+      action: () => emit("locate-sql-library-file", tab),
     },
-    {
-      label: t("contextMenu.splitDown"),
-      action: () => queryStore.splitTabDown(tab.id),
-      disabled: splitUnavailable.value,
-      icon: ArrowDown,
-    },
-    ...(canChangeOrientation.value
-      ? [
-          {
-            label: t("contextMenu.changeOrientation"),
-            action: () => queryStore.setOrientation(queryStore.orientation === "vertical" ? "horizontal" : "vertical"),
-            icon: RotateCw,
-          },
-        ]
-      : []),
-    ...(isSecondaryGroup.value
-      ? [
-          {
-            label: t("contextMenu.unsplit"),
-            action: () => queryStore.unsplitTab(tab.id),
-            icon: ArrowRight,
-            visible: true,
-          },
-        ]
-      : []),
-    createCloseOtherTabMenuItem({
-      label: t("contextMenu.closeOtherTabs"),
-      onClose: () => queryStore.closeOtherTabsInGroup(props.groupId, tab.id),
-    }),
-    createCloseLeftTabMenuItem({
-      label: t("contextMenu.closeLeftTabs"),
-      disabled: !hasTabsToLeft(tab),
-      onClose: () => {
-        const tabsToClose = tabsToLeftInDisplayOrder(tab).map((item) => item.id);
-        const finalActiveTabId = queryStore.activeTabId && !tabsToClose.includes(queryStore.activeTabId) ? queryStore.activeTabId : tab.id;
-        queryStore.closeTabsByIds(tabsToClose, finalActiveTabId);
-      },
-    }),
-    createCloseRightTabMenuItem({
-      label: t("contextMenu.closeRightTabs"),
-      disabled: !hasTabsToRight(tab),
-      onClose: () => {
-        const tabsToClose = tabsToRightInDisplayOrder(tab).map((item) => item.id);
-        const finalActiveTabId = queryStore.activeTabId && !tabsToClose.includes(queryStore.activeTabId) ? queryStore.activeTabId : tab.id;
-        queryStore.closeTabsByIds(tabsToClose, finalActiveTabId);
-      },
-    }),
-    createCloseAllTabMenuItem({
-      label: t("contextMenu.closeAllTabs"),
-      onClose: () => queryStore.closeAllTabsInGroup(props.groupId, tab.id),
-    }),
-    createSaveAllTabsMenuItem({
-      label: t("contextMenu.saveAllTabs"),
-      disabled: !queryStore.hasDirtyTabs,
-      shortcut: formatShortcut(settingsStore.editorSettings.shortcuts?.saveAllTabs ?? ""),
-      onSaveAll: () => handleSaveAllTabs(),
-    }),
-    {
-      label: t("contextMenu.closeTabGroup"),
-      action: () => closeTabGroup(tab),
-      visible: settingsStore.editorSettings.tabGroupMode !== "none",
-      icon: X,
-    },
-    createCloseTabMenuItem({
-      label: t("contextMenu.closeTab"),
-      onClose: () => closeTab(tab),
-    }),
-    createReopenClosedTabMenuItem({
-      label: t("contextMenu.reopenClosedTab"),
-      disabled: !queryStore.canReopenClosedTab,
-      shortcut: formatShortcut(settingsStore.editorSettings.shortcuts?.reopenClosedTab ?? "Shift+Mod+T"),
-      onReopen: () => queryStore.reopenClosedTab(),
-    }),
   ];
   return items;
 }
@@ -1800,6 +1826,10 @@ function getTabMenuItems(tab: QueryTab): ContextMenuItem[] {
 function handleTabDoubleClick(tab: QueryTab, event: MouseEvent) {
   event.stopPropagation();
   if (event.target instanceof Element && event.target.closest("button, input, [role='button']")) {
+    return;
+  }
+  if (settingsStore.editorSettings.tabDoubleClickAction === "close") {
+    closeTab(tab);
     return;
   }
   if (tab.mode === "data") {
@@ -1953,10 +1983,12 @@ const tabScrollBehavior = ref<ScrollBehavior>("smooth");
 
 watch(
   () => props.activeTabId,
-  (tabId) => {
+  (tabId, previousTabId) => {
     lastDispatchedSwitchTabId = null;
-    // A tab that just became active must be visible: reveal its group if collapsed.
-    expandTabGroupForTab(tabId);
+    // Closing the active tab selects a fallback without changing other groups.
+    if (!previousTabId || queryStore.tabs.some((tab) => tab.id === previousTabId)) {
+      expandTabGroupForTab(tabId);
+    }
     if (isTwoRowLayout.value && tabId) {
       const tab = queryStore.tabs.find((item) => item.id === tabId);
       if (tab) {
@@ -2069,7 +2101,7 @@ watch([() => props.specialPageTabs?.settingsActive, () => props.specialPageTabs?
       <Tooltip v-if="canNewQuery">
         <TooltipTrigger as-child>
           <button type="button" data-new-query-tab :class="verticalTabToolbarButtonClass" :aria-label="t('toolbar.newQuery')" @click="toolbar?.newQuery(groupId)">
-            <Plus class="h-4 w-4" />
+            <FilePlus2 class="h-4 w-4" />
           </button>
         </TooltipTrigger>
         <TooltipContent>{{ t("toolbar.newQuery") }}</TooltipContent>
@@ -2190,7 +2222,10 @@ watch([() => props.specialPageTabs?.settingsActive, () => props.specialPageTabs?
         </div>
       </div>
     </div>
-    <div class="relative flex w-full min-w-0 shrink-0 overflow-hidden" :class="[isVerticalLayout ? ['min-h-0 flex-1 flex-col items-stretch'] : isClassicLayout ? 'h-9 items-stretch' : 'h-10 items-center px-2', { 'has-tab-overflow-control': showOverflowControl }]">
+    <div
+      class="relative flex w-full min-w-0 shrink-0 overflow-hidden"
+      :class="[isVerticalLayout ? ['min-h-0 flex-1 flex-col items-stretch'] : isClassicLayout ? 'h-9 items-stretch' : 'h-10 items-center px-2', { 'has-tab-overflow-control': showOverflowControl, 'has-tab-action-controls': showOverflowControl && canNewQuery }]"
+    >
       <LightDropdown
         v-if="!isVerticalLayout && !isTwoRowLayout"
         model-value=""
@@ -2476,19 +2511,20 @@ watch([() => props.specialPageTabs?.settingsActive, () => props.specialPageTabs?
           <button
             type="button"
             data-new-query-tab
-            class="mx-0.5 inline-flex h-7 w-7 shrink-0 self-center items-center justify-center rounded-md text-muted-foreground hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            class="tab-bar-action-button inline-flex shrink-0 self-center items-center justify-center rounded-md focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            :class="showOverflowControl ? ['absolute right-7', 'top-1/2 z-30 -translate-y-1/2'] : 'mx-0.5'"
             :aria-label="t('toolbar.newQuery')"
             @click="toolbar?.newQuery(groupId)"
           >
-            <Plus class="h-4 w-4" />
+            <FilePlus2 class="h-4 w-4" />
           </button>
         </TooltipTrigger>
         <TooltipContent>{{ t("toolbar.newQuery") }}</TooltipContent>
       </Tooltip>
-      <div v-if="showOverflowControl" class="tab-overflow-control absolute top-0 z-30 flex h-full items-center" :class="canNewQuery ? (isClassicLayout ? 'right-[2.125rem]' : 'right-[2.625rem]') : 'right-0'">
+      <div v-if="showOverflowControl" class="tab-overflow-control absolute right-0 top-0 z-30 flex h-full items-center">
         <Popover v-model:open="tabOverflowOpen">
           <PopoverTrigger as-child>
-            <button type="button" class="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-md border border-border/60 bg-background text-foreground/70 hover:border-border hover:text-foreground" :aria-label="t('tabs.openTabs')" :title="t('tabs.openTabs')">
+            <button type="button" class="tab-bar-action-button inline-flex shrink-0 items-center justify-center rounded-md focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring" :aria-label="t('tabs.openTabs')" :title="t('tabs.openTabs')">
               <ChevronDown class="h-4 w-4" />
             </button>
           </PopoverTrigger>

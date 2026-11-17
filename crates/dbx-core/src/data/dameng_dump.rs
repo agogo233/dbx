@@ -8,8 +8,9 @@
 //!
 //! The password necessarily rides on the command line (Dameng requires `USERID`
 //! as the first argument — see the dbx-sql module docs), so the spawned
-//! process must stay short-lived; `PARFILE` keeps everything else out of the
-//! process list.
+//! process must stay short-lived; `PARFILE` keeps the schema/table parameters out
+//! of the process list, while FILE/LOG ride on the command line so Windows paths
+//! keep their native separators (#13585).
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -329,14 +330,15 @@ pub async fn run_dameng_dump_task(
         emit(DamengDumpStatus::Error, false, false, None, Some(error.clone()));
         return Err(error);
     }
-    // A `/` or `@` in the user or password would be read as a USERID field
-    // separator by the tool, and a space would end the token early; both surface as a
-    // bogus host / connection error, so reject them up front instead of launching.
+    // The password rides quoted in USERID, so `/` and `@` are fine there; a
+    // `"` or whitespace in the password still cannot be encoded, and neither can
+    // `/`, `@`, or whitespace in the username. Those surface as a bogus host /
+    // connection error, so reject them up front instead of launching.
     if let Some(field) = userid_field_error(&config.username, &config.password) {
         let error = tagged(
             DAMENG_USERID_INVALID_TAG,
             &format!(
-                "The connection's {field} contains '/', '@' or a space, which the dexp/dimp USERID argument \
+                "The connection's {field} contains a character the dexp/dimp USERID argument \
                  cannot encode; the task was not started."
             ),
         );
@@ -578,7 +580,7 @@ mod tests {
                 "@echo off\r\necho dexp V8> \"%~dp0run.log\"\r\necho terminated successfully>> \"%~dp0run.log\"\r\n",
             )
             .unwrap();
-            (tool, vec!["USERID=u/p@h:5236".to_string(), "PARFILE=x".to_string()], false)
+            (tool, vec!["USERID=u/\"p\"@h:5236".to_string(), "PARFILE=x".to_string()], false)
         };
         #[cfg(not(windows))]
         let (tool, tool_args, expect_elapsed) = {
@@ -590,7 +592,7 @@ mod tests {
             )
             .unwrap();
             std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
-            (tool, vec!["USERID=u/p@h:5236".to_string(), "PARFILE=x".to_string()], true)
+            (tool, vec!["USERID=u/\"p\"@h:5236".to_string(), "PARFILE=x".to_string()], true)
         };
 
         let mut argv = vec![tool.to_string_lossy().into_owned()];

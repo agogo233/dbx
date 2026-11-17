@@ -35,6 +35,13 @@ const connectionStore = {
   loadEtcdRoot: vi.fn(async () => undefined),
   loadMilvusDatabases: vi.fn(async () => undefined),
   loadElasticsearchIndices: vi.fn(async () => undefined),
+  loadMqttTopics: vi.fn(async () => undefined),
+  loadMqTenants: vi.fn(async () => undefined),
+  loadNacosNamespaces: vi.fn(async () => undefined),
+  loadDynamoDbTables: vi.fn(async () => undefined),
+  loadZooKeeperRoot: vi.fn(async () => undefined),
+  loadConsulRoot: vi.fn(async () => undefined),
+  loadVectorCollections: vi.fn(async () => undefined),
   loadCustomTypeChildren: vi.fn(async (node: TreeNode) => {
     node.hasMembers = true;
     node.children = [{ id: `${node.id}:attribute`, label: "STREET", type: "type-member", connectionId: node.connectionId, database: node.database }];
@@ -63,6 +70,8 @@ const settingsStore = {
   editorSettings: {
     sidebarActivation: "single" as "single" | "double",
     sidebarBrowseObjectsOnDatabaseActivation: false,
+    sidebarAutoExpandOnDatabaseActivation: false,
+    sidebarTableClickNavigation: false,
     shortcuts: { openDataInNewTab: "" },
   },
 };
@@ -100,7 +109,8 @@ const mountedApps: App[] = [];
 const compiledSearchHandlers = compileConnectionTreeTestScript(["onSearchToggle", "onNodeToggled"]);
 
 function searchHandlers(searchCollapsedIds: { value: Set<string> }) {
-  const bindings = { searchCollapsedIds, isTreeSearchFiltering: ref(true), store: connectionStore, syncSidebarTreeNodeExpansion, sidebarLayoutMonitor: { recordEvent: vi.fn() } };
+  const searchExpandedIds = ref(new Set<string>());
+  const bindings = { searchCollapsedIds, searchExpandedIds, isTreeSearchFiltering: ref(true), store: connectionStore, syncSidebarTreeNodeExpansion, sidebarLayoutMonitor: { recordEvent: vi.fn() } };
   return new Function(...Object.keys(bindings), `${compiledSearchHandlers}; return { onSearchToggle, onNodeToggled };`)(...Object.values(bindings)) as {
     onSearchToggle: (node: TreeNode) => void;
     onNodeToggled: (node: TreeNode, expanded: boolean) => void;
@@ -117,6 +127,8 @@ afterEach(() => {
   queryStore.tabs = [];
   settingsStore.editorSettings.sidebarActivation = "single";
   settingsStore.editorSettings.sidebarBrowseObjectsOnDatabaseActivation = false;
+  settingsStore.editorSettings.sidebarAutoExpandOnDatabaseActivation = false;
+  settingsStore.editorSettings.sidebarTableClickNavigation = false;
   vi.clearAllMocks();
   connectionStore.canUseLoadedTreeNodeToggle.mockReturnValue(true);
   connectionStore.getConfig.mockReturnValue({ db_type: "mysql", name: "connection" });
@@ -232,6 +244,37 @@ describe("SidebarTreeRuntimeHost expansion", () => {
     window.removeEventListener(OBJECT_BROWSER_SEARCH_FOCUS_EVENT, focusRequested);
   });
 
+  it.each([
+    ["single", false],
+    ["single", true],
+    ["double", false],
+    ["double", true],
+  ] as const)("keeps expansion %s/%s while opening objects without loading the tree", async (activation, isExpanded) => {
+    const database: TreeNode = { id: "mysql:inventory", label: "inventory", type: "database", connectionId: "mysql", database: "inventory", isExpanded, children: [] };
+    settingsStore.editorSettings.sidebarActivation = activation;
+    settingsStore.editorSettings.sidebarBrowseObjectsOnDatabaseActivation = true;
+    settingsStore.editorSettings.sidebarTableClickNavigation = true;
+    const host = ref<InstanceType<typeof SidebarTreeRuntimeHost> | null>(null);
+    const app = createApp(defineComponent({ setup: () => () => h(SidebarTreeRuntimeHost, { ref: host, node: database, depth: 0 }) }));
+    mountedApps.push(app);
+    const container = document.createElement("div");
+    document.body.append(container);
+    app.use(i18n);
+    app.mount(container);
+
+    // Exercise the complete browser event sequence in either activation mode.
+    host.value!.handleRowClick(database, 1, true);
+    host.value!.handleRowClick(database, 2, true);
+    host.value!.handleRowDoubleClick(database, new MouseEvent("dblclick"));
+    await vi.waitFor(() => expect(queryStore.openObjectBrowser).toHaveBeenCalledOnce());
+    expect(database.isExpanded).toBe(isExpanded);
+    expect(connectionStore.loadTables).not.toHaveBeenCalled();
+
+    // The preference must not block explicit arrow expansion/collapse.
+    host.value!.toggleNode(database);
+    await vi.waitFor(() => expect(database.isExpanded).toBe(!isExpanded));
+  });
+
   it("toggles an expanded database closed on double-click in double-click activation mode", async () => {
     const database: TreeNode = {
       id: "mysql:dbx_test",
@@ -244,6 +287,7 @@ describe("SidebarTreeRuntimeHost expansion", () => {
     };
     settingsStore.editorSettings.sidebarActivation = "double";
     settingsStore.editorSettings.sidebarBrowseObjectsOnDatabaseActivation = true;
+    settingsStore.editorSettings.sidebarAutoExpandOnDatabaseActivation = true;
 
     const host = ref<InstanceType<typeof SidebarTreeRuntimeHost> | null>(null);
     const app = createApp(defineComponent({ setup: () => () => h(SidebarTreeRuntimeHost, { ref: host, node: database, depth: 0 }) }));
@@ -271,6 +315,7 @@ describe("SidebarTreeRuntimeHost expansion", () => {
     };
     settingsStore.editorSettings.sidebarActivation = "single";
     settingsStore.editorSettings.sidebarBrowseObjectsOnDatabaseActivation = true;
+    settingsStore.editorSettings.sidebarAutoExpandOnDatabaseActivation = true;
 
     const host = ref<InstanceType<typeof SidebarTreeRuntimeHost> | null>(null);
     const app = createApp(defineComponent({ setup: () => () => h(SidebarTreeRuntimeHost, { ref: host, node: database, depth: 0 }) }));
@@ -363,6 +408,7 @@ describe("SidebarTreeRuntimeHost expansion", () => {
     });
     connectionStore.ensureConnected.mockReturnValue(connection);
     settingsStore.editorSettings.sidebarBrowseObjectsOnDatabaseActivation = true;
+    settingsStore.editorSettings.sidebarAutoExpandOnDatabaseActivation = true;
 
     const database: TreeNode = {
       id: "mysql:inventory",
@@ -836,6 +882,17 @@ describe("SidebarTreeRuntimeHost expansion", () => {
 
     expect(group.isExpanded).toBe(false);
     expect(connectionStore.releaseCollapsedTreeNodeChildren).not.toHaveBeenCalled();
+  });
+
+  it("clears the collapsed marker of a search table whose children are not loaded (#13856)", () => {
+    // Search results list the table before its column/index groups exist, and
+    // collapse-all seeds every expandable id; expanding must clear the table's
+    // own id even without children, or the groups stay hidden.
+    const table: TreeNode = { id: "sqlserver:app:dbo:orders", label: "orders", type: "table", connectionId: "sqlserver", database: "app", schema: "dbo", isExpanded: false };
+    const collapsedIds = ref(new Set([table.id]));
+    const handlers = searchHandlers(collapsedIds);
+    handlers.onSearchToggle(table);
+    expect(collapsedIds.value.has(table.id)).toBe(false);
   });
 
   it("expands a collapsed search projection without reloading its live subtree", async () => {
@@ -1372,7 +1429,7 @@ describe("SidebarTreeRuntimeHost expansion", () => {
 
     connectionStore.treeNodes = [connectionNode];
     connectionStore.loadDatabases = vi.fn(async () => {
-      // Loader attaches children but does not auto-expand the node in this harness.
+      // This harness stubs the loader, so it only attaches children; the shared toggle path must still set expansion.
       connectionNode.children = [databaseNode];
     });
 
@@ -1468,16 +1525,23 @@ describe("SidebarTreeRuntimeHost expansion", () => {
   });
 
   // #13579: the manual-expansion regression hit every connection type, not just
-  // SQL engines. Each loader below attaches children without auto-expanding the
-  // node (the switch is off for this harness), so the shared toggle path must
-  // expand the connection node itself.
+  // SQL engines. The store loaders now always expand after loading, but this
+  // harness stubs each loader, so children arrive without pre-set isExpanded and
+  // the shared toggle path must still expand the connection node itself.
   it.each([
     { dbType: "redis", loader: "loadRedisDatabases" as const, childType: "redis-db" as const },
     { dbType: "mongodb", loader: "loadMongoDatabases" as const, childType: "mongo-db" as const },
     { dbType: "etcd", loader: "loadEtcdRoot" as const, childType: "etcd-root" as const },
     { dbType: "milvus", loader: "loadMilvusDatabases" as const, childType: "vector-database" as const },
     { dbType: "elasticsearch", loader: "loadElasticsearchIndices" as const, childType: "elasticsearch-index" as const },
-  ])("expands a $dbType connection on first click (issue #13579)", async ({ dbType, loader, childType }) => {
+    { dbType: "mqtt", loader: "loadMqttTopics" as const, childType: "mqtt-topic" as const },
+    { dbType: "mq", loader: "loadMqTenants" as const, childType: "mq-tenant" as const },
+    { dbType: "nacos", loader: "loadNacosNamespaces" as const, childType: "nacos-namespace" as const, extraCallArgs: [undefined] },
+    { dbType: "dynamodb", loader: "loadDynamoDbTables" as const, childType: "dynamodb-table" as const },
+    { dbType: "zookeeper", loader: "loadZooKeeperRoot" as const, childType: "zookeeper-root" as const },
+    { dbType: "consul", loader: "loadConsulRoot" as const, childType: "consul-root" as const },
+    { dbType: "qdrant", loader: "loadVectorCollections" as const, childType: "vector-collection" as const },
+  ])("expands a $dbType connection on first click (issue #13579)", async ({ dbType, loader, childType, extraCallArgs }) => {
     const connectionId = `${dbType}-conn`;
     const child: TreeNode = {
       id: `${connectionId}:child`,
@@ -1518,7 +1582,7 @@ describe("SidebarTreeRuntimeHost expansion", () => {
     host.value?.toggleNode(connectionNode);
     await vi.waitFor(() => expect(connectionNode.isExpanded).toBe(true));
 
-    expect(loaderMock).toHaveBeenCalledWith(connectionId);
+    expect(loaderMock).toHaveBeenCalledWith(connectionId, ...(extraCallArgs ?? []));
     expect(connectionNode.children?.map((node) => node.label)).toEqual([`${dbType} child`]);
   });
 });

@@ -19,9 +19,46 @@ const trackerMock = vi.hoisted(() => ({
 vi.mock("@/lib/backend/api", () => apiMock);
 vi.mock("@/composables/useDialogSources", () => ({ openSchemaDiffSession: openMock }));
 vi.mock("@/composables/useExportTracker", () => ({ useExportTracker: () => trackerMock }));
-vi.mock("@/lib/schema/schemaDiffMetadataLoad", () => ({ loadSchemaDetails: vi.fn().mockResolvedValue([]) }));
+vi.mock("@/lib/schema/schemaDiffMetadataLoad", async (importOriginal) => ({ ...(await importOriginal<typeof import("@/lib/schema/schemaDiffMetadataLoad")>()), loadSchemaDetails: vi.fn().mockResolvedValue([]) }));
+vi.mock("@/lib/metadata/objectMetadataCache", () => ({ invalidateObjectMetadataCache: vi.fn().mockResolvedValue(undefined) }));
 
 const { startSchemaDiffSession } = await import("../useSchemaDiffSession.ts");
+
+test("defers DDL per side, only for SQL Server endpoints and tables on both sides", async () => {
+  const { loadSchemaDetails } = await import("@/lib/schema/schemaDiffMetadataLoad");
+  vi.clearAllMocks();
+  const session = startSchemaDiffSession(
+    {
+      sourceConnectionId: "ddl-source",
+      sourceDatabase: "app",
+      sourceSchema: "dbo",
+      targetConnectionId: "ddl-target",
+      targetDatabase: "app",
+      targetSchema: "public",
+      sourceDbType: "sqlserver",
+      targetDbType: "postgres",
+      options: {},
+      ignoreComments: false,
+      label: "deferred ddl",
+    },
+    {
+      tableListLoader: {
+        load: vi.fn(
+          async ({ schema }: { schema: string }) =>
+            [
+              { name: "shared", table_type: "BASE TABLE" },
+              { name: schema === "dbo" ? "added" : "removed", table_type: "BASE TABLE" },
+            ] as never[],
+        ),
+      },
+    },
+  );
+  await waitForSession(session);
+  const [sourceCall, targetCall] = vi.mocked(loadSchemaDetails).mock.calls;
+  assert.deepEqual([...(sourceCall?.[1].deferredDdlTables ?? [])], ["shared"]);
+  assert.deepEqual([...(targetCall?.[1].deferredDdlTables ?? [])], []);
+  vi.clearAllMocks();
+});
 
 test("disconnecting either side stops the compare after its issued table-list requests settle", async () => {
   const { cancelSchemaDiffTasksForConnection } = await import("@/lib/schema/schemaDiffCancellation");
@@ -85,12 +122,48 @@ test("applies every exclude rule before loading source and target details", asyn
   await waitForSession(session);
   assert.equal(session.status, "completed");
   assert.equal(vi.mocked(loadSchemaDetails).mock.calls.length, 2);
+  const { invalidateObjectMetadataCache } = await import("@/lib/metadata/objectMetadataCache");
+  assert.deepEqual(
+    vi.mocked(invalidateObjectMetadataCache).mock.calls.map(([match]) => match),
+    [
+      { connectionId: "source", database: "app" },
+      { connectionId: "target", database: "warehouse" },
+    ],
+  );
   for (const [tables] of vi.mocked(loadSchemaDetails).mock.calls) {
     assert.deepEqual(
       tables.map((table) => table.name),
       ["users"],
     );
   }
+  vi.clearAllMocks();
+});
+
+test("skips metadata cache invalidation when refreshMetadata is turned off", async () => {
+  const { loadSchemaDetails } = await import("@/lib/schema/schemaDiffMetadataLoad");
+  const { invalidateObjectMetadataCache } = await import("@/lib/metadata/objectMetadataCache");
+  vi.clearAllMocks();
+  apiMock.prepareSchemaDiff.mockResolvedValue({ diffs: [], renameCandidates: [], syncSql: "", rollbackSyncSql: "" });
+  const session = startSchemaDiffSession(
+    {
+      sourceConnectionId: "source",
+      sourceDatabase: "app",
+      sourceSchema: "",
+      targetConnectionId: "target",
+      targetDatabase: "warehouse",
+      targetSchema: "",
+      sourceDbType: "mysql",
+      targetDbType: "mysql",
+      options: { functions: false, refreshMetadata: false },
+      ignoreComments: false,
+      label: "cached compare",
+    },
+    { tableListLoader: { load: vi.fn().mockResolvedValue([{ name: "users", table_type: "BASE TABLE" }]) } },
+  );
+  await waitForSession(session);
+  assert.equal(session.status, "completed");
+  assert.equal(vi.mocked(loadSchemaDetails).mock.calls.length, 2);
+  assert.equal(vi.mocked(invalidateObjectMetadataCache).mock.calls.length, 0);
   vi.clearAllMocks();
 });
 

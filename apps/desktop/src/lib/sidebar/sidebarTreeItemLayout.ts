@@ -8,6 +8,7 @@ const leafTypes: Set<TreeNodeType> = new Set([
   "event",
   "procedure",
   "function",
+  "postgres-aggregate-functions",
   "synonym",
   "oracle-db-link",
   "package",
@@ -17,7 +18,6 @@ const leafTypes: Set<TreeNodeType> = new Set([
   "type-attribute",
   "type-method",
   "object-browser",
-  "redis-db",
   "mqtt-topic",
   "mq-tenant",
   "etcd-root",
@@ -44,12 +44,11 @@ const leafTypes: Set<TreeNodeType> = new Set([
   "datafile",
 ]);
 
-// Search controls are laid out against the viewport. Every other visible tree
-// row may contain a user supplied name and must be able to contribute to the
-// horizontal scroll width when that setting is enabled.
+// Controls stay viewport-sized. Names, including connections and groups, may
+// contribute their natural width when the user allows horizontal scrolling.
 const nonNaturalWidthTypes: Set<TreeNodeType> = new Set(["table-search-control", "load-more"]);
 
-const emptyContainerTypes: Set<TreeNodeType> = new Set(["saved-sql-root", "saved-sql-folder", "type"]);
+const emptyContainerTypes: Set<TreeNodeType> = new Set(["redis-db", "saved-sql-root", "saved-sql-folder", "type"]);
 
 const pinnableTypes: Set<TreeNodeType> = new Set([
   "connection-group",

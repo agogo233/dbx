@@ -919,6 +919,76 @@ describe("useDataGridActions", () => {
     expect(tab.orderByInput).toBe("LOWER(new_name) ASC");
   });
 
+  it("keeps the active column sort when a refresh rebuilds the same columns", async () => {
+    // issue #13350 的期望行为：列头排序后点刷新，只要排序列仍在重建后的表结构里，
+    // ORDER BY 必须原样下推，排序状态原样保留，数据继续按该列有序。
+    const columns = [
+      { name: "id", data_type: "integer", is_nullable: false, column_default: null, is_primary_key: true, extra: null },
+      { name: "create_time", data_type: "timestamp", is_nullable: true, column_default: null, is_primary_key: false, extra: null },
+    ];
+    const tab = tableDataTab({
+      resultSortColumn: "create_time",
+      resultSortColumnIndex: 1,
+      resultSortDirection: "asc",
+      resultSortMode: "database",
+      orderByInput: '"create_time" ASC',
+      tableMeta: {
+        schema: "public",
+        tableName: "users",
+        tableType: "TABLE",
+        columns,
+        primaryKeys: ["id"],
+      },
+    });
+    mocks.tabs.push(tab);
+    mocks.getColumns.mockResolvedValue(columns);
+    const actions = useDataGridActions(computed(() => tab));
+
+    await actions.onReloadData(tab.id, tab.sql, "", "", '"create_time" ASC', undefined, undefined, "refresh");
+
+    expect(mocks.buildTableSelectSql).toHaveBeenCalledWith(expect.objectContaining({ orderBy: '"create_time" ASC' }));
+    expect(tab.resultSortColumn).toBe("create_time");
+    expect(tab.resultSortDirection).toBe("asc");
+    expect(tab.orderByInput).toBe('"create_time" ASC');
+  });
+
+  it("clears the header sort state when a refresh drops the incoming order", async () => {
+    // 不变量（issue #13350 的用户可见症状）：刷新一旦移除 ORDER BY，列头排序图标
+    // 必须同步熄灭，否则出现「图标亮、数据无序」的错位。构造 grid 发来的 orderBy
+    // 引用了已不存在的列，而标签页排序状态仍指向存活的 create_time —— 元数据
+    // 重建不会清理它，移除 ORDER BY 后排序状态必须一并清理。
+    const columns = [
+      { name: "id", data_type: "integer", is_nullable: false, column_default: null, is_primary_key: true, extra: null },
+      { name: "create_time", data_type: "timestamp", is_nullable: true, column_default: null, is_primary_key: false, extra: null },
+    ];
+    const tab = tableDataTab({
+      resultSortColumn: "create_time",
+      resultSortColumnIndex: 1,
+      resultSortDirection: "asc",
+      resultSortMode: "database",
+      orderByInput: '"create_time" ASC',
+      tableMeta: {
+        schema: "public",
+        tableName: "users",
+        tableType: "TABLE",
+        columns,
+        primaryKeys: ["id"],
+      },
+    });
+    mocks.tabs.push(tab);
+    mocks.getColumns.mockResolvedValue(columns);
+    const actions = useDataGridActions(computed(() => tab));
+
+    await actions.onReloadData(tab.id, tab.sql, "", "", '"ghost_col" ASC', undefined, undefined, "refresh");
+
+    expect(mocks.buildTableSelectSql).toHaveBeenCalledWith(expect.objectContaining({ orderBy: undefined }));
+    expect(tab.orderByInput).toBeUndefined();
+    expect(tab.resultSortColumn).toBeUndefined();
+    expect(tab.resultSortColumnIndex).toBeUndefined();
+    expect(tab.resultSortDirection).toBeUndefined();
+    expect(tab.resultSortMode).toBeUndefined();
+  });
+
   it("keeps SQL result toolbar reload free of table pagination defaults", async () => {
     const tab = {
       id: "tab-1",
@@ -1664,6 +1734,75 @@ describe("useDataGridActions", () => {
     // 重试也失败：标记还原，后续仍按原行为注入定位器
     mocks.buildTableSelectSql.mockClear();
     await actions.onReloadData(tab.id, tab.sql, "", "", "", 100, 0, "refresh");
+    expect(mocks.buildTableSelectSql).toHaveBeenCalledWith(expect.objectContaining({ includeRowId: true }));
+  });
+
+  it("retries a failed keyless-table database sort without the row-id locator and remembers the connection (Greenplum AO, #14922)", async () => {
+    const keylessColumn = { name: "payload", data_type: "text", is_nullable: true, column_default: null, is_primary_key: false, extra: null };
+    const tab = tableDataTab({
+      resultPageLimit: 100,
+      result: { columns: ["payload"], rows: [[1]], affected_rows: 0, execution_time_ms: 1 },
+      tableMeta: {
+        schema: "public",
+        tableName: "events",
+        tableType: "TABLE",
+        columns: [keylessColumn],
+        primaryKeys: [],
+      },
+    });
+    mocks.tabs.push(tab);
+    const locatorSql = `SELECT tableoid::text || ':' || ctid::text || ':' || xmin::text AS "__DBX_ROWID", * FROM "public"."events" ORDER BY "payload" ASC LIMIT 100 OFFSET 0;`;
+    const fallbackSql = `SELECT * FROM "public"."events" ORDER BY "payload" ASC LIMIT 100 OFFSET 0;`;
+    mocks.buildTableSelectSql.mockImplementation(({ includeRowId }: { includeRowId?: boolean }) => Promise.resolve(includeRowId ? locatorSql : fallbackSql));
+    mocks.executeTabSql.mockImplementation(async (_id: string, sql: string) => {
+      tab.result = sql.includes("__DBX_ROWID")
+        ? ({ columns: ["Error"], rows: [["ERROR: Invalid attnum: -3"]], affected_rows: 0, execution_time_ms: 1, execution_error: true } as QueryTab["result"])
+        : ({ columns: ["payload"], rows: [[1]], affected_rows: 0, execution_time_ms: 1 } as QueryTab["result"]);
+    });
+    const actions = useDataGridActions(computed(() => tab));
+
+    await actions.onSort(tab.id, "payload", 0, "asc");
+
+    // 首次带定位器的排序失败 → 降级重试一次成功，表仍可排序浏览（只读）
+    expect(mocks.executeTabSql).toHaveBeenCalledTimes(2);
+    expect(mocks.executeTabSql).toHaveBeenNthCalledWith(2, "tab-1", fallbackSql, expect.objectContaining({ pagination: { limit: 100, offset: 0 } }));
+    expect(mocks.buildTableSelectSql).toHaveBeenLastCalledWith(expect.objectContaining({ includeRowId: false }));
+    expect(tab.result?.execution_error).toBeUndefined();
+    // 连接已记忆：后续排序不再注入定位器
+    mocks.executeTabSql.mockClear();
+    mocks.buildTableSelectSql.mockClear();
+    await actions.onSort(tab.id, "payload", 0, "desc");
+    expect(mocks.buildTableSelectSql).toHaveBeenCalledWith(expect.objectContaining({ includeRowId: false }));
+    expect(mocks.executeTabSql).toHaveBeenCalledTimes(1);
+    expect(mocks.executeTabSql).toHaveBeenCalledWith("tab-1", fallbackSql, expect.anything());
+  });
+
+  it("restores the locator when the sort fallback retry also fails so the real error stays visible (#14922)", async () => {
+    const keylessColumn = { name: "payload", data_type: "text", is_nullable: true, column_default: null, is_primary_key: false, extra: null };
+    const tab = tableDataTab({
+      resultPageLimit: 100,
+      tableMeta: {
+        schema: "public",
+        tableName: "events",
+        tableType: "TABLE",
+        columns: [keylessColumn],
+        primaryKeys: [],
+      },
+    });
+    mocks.tabs.push(tab);
+    const errorResult = { columns: ["Error"], rows: [["ERROR: relation does not exist"]], affected_rows: 0, execution_time_ms: 1, execution_error: true } as QueryTab["result"];
+    mocks.buildTableSelectSql.mockImplementation(({ includeRowId }: { includeRowId?: boolean }) => Promise.resolve(includeRowId ? `SELECT ... AS "__DBX_ROWID", * FROM t` : `SELECT * FROM t`));
+    mocks.executeTabSql.mockImplementation(async () => {
+      tab.result = errorResult;
+    });
+    const actions = useDataGridActions(computed(() => tab));
+
+    await actions.onSort(tab.id, "payload", 0, "asc");
+
+    expect(mocks.executeTabSql).toHaveBeenCalledTimes(2);
+    // 重试也失败：标记还原，后续仍按原行为注入定位器
+    mocks.buildTableSelectSql.mockClear();
+    await actions.onSort(tab.id, "payload", 0, "asc");
     expect(mocks.buildTableSelectSql).toHaveBeenCalledWith(expect.objectContaining({ includeRowId: true }));
   });
 });

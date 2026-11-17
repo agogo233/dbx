@@ -730,6 +730,43 @@ fn qualified_table_with_identifier_quote(
     }
 }
 
+/// Whether write SQL should use an identifier quote the caller resolved for the connection
+/// instead of the static transfer mapping. Callers that pass `None` keep the transfer mapping, so
+/// their generated SQL is unchanged.
+fn uses_explicit_identifier_quote(db_type: &DatabaseType, identifier_quote: Option<&str>) -> bool {
+    identifier_quote.is_some() && crate::sql_dialect::uses_connection_identifier_quote(Some(*db_type), identifier_quote)
+}
+
+/// Quotes a write-target identifier with the connection's identifier quote, falling back to
+/// [`quote_identifier`] when there is none.
+pub(crate) fn quote_identifier_with_explicit_quote(
+    name: &str,
+    db_type: &DatabaseType,
+    identifier_quote: Option<&str>,
+) -> String {
+    if uses_explicit_identifier_quote(db_type, identifier_quote) {
+        quote_identifier_with_identifier_quote(name, db_type, identifier_quote)
+    } else {
+        quote_identifier(name, db_type)
+    }
+}
+
+/// Qualifies a write-target table with the connection's identifier quote, falling back to
+/// [`qualified_table`] when there is none.
+pub(crate) fn qualified_table_with_explicit_quote(
+    table: &str,
+    schema: &str,
+    db_type: &DatabaseType,
+    catalog: Option<&str>,
+    identifier_quote: Option<&str>,
+) -> String {
+    if uses_explicit_identifier_quote(db_type, identifier_quote) {
+        qualified_table_with_identifier_quote(table, schema, db_type, catalog, identifier_quote)
+    } else {
+        qualified_table(table, schema, db_type, catalog)
+    }
+}
+
 pub fn validate_transfer_target_table_names(request: &TransferRequest) -> Result<(), String> {
     let mut targets: HashMap<String, String> = HashMap::new();
     for source_table in &request.tables {
@@ -2537,6 +2574,39 @@ async fn execute_sqlserver_identity_batch(
     Ok(())
 }
 
+/// Matches a quoted date literal whose month or day is zero (`'0000-00-00'`,
+/// `'2026-00-00'`, `'2026-05-00 10:00:00'`).
+static MYSQL_ZERO_DATE_LITERAL_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+    Regex::new(r"'\d{4}-(?:00-\d{2}|\d{2}-00)\b").expect("valid MySQL zero date literal regex")
+});
+
+/// Wraps a MySQL write batch that carries zero dates so the target session accepts them.
+///
+/// MySQL 5.7+ enables `NO_ZERO_DATE` and `NO_ZERO_IN_DATE` together with strict mode by
+/// default, so rows that a MySQL source legitimately holds (written under a relaxed
+/// `sql_mode`) fail with `ERROR 1292` when copied verbatim. Only those two flags are
+/// dropped; strict mode keeps rejecting every other invalid value. The original mode is
+/// restored after the batch. When the batch fails, the restoring statement never runs;
+/// transfer pools carry no client session, so they are multi-connection MySQL pools built
+/// with `with_reset_connection`, and the connection is reset before its next use
+/// (covered by `live_mysql_transfer_copies_zero_dates_under_strict_target_sql_mode`).
+///
+/// Returns `None` when the batch has no zero date literal, so ordinary batches (and
+/// MySQL-protocol servers without `sql_mode`) are sent unchanged.
+fn mysql_zero_date_tolerant_write_sql(sql: &str) -> Option<String> {
+    if !MYSQL_ZERO_DATE_LITERAL_RE.is_match(sql) {
+        return None;
+    }
+    let statement = sql.trim_end().trim_end_matches(';');
+    Some(format!(
+        "SET @dbx_transfer_sql_mode = @@SESSION.sql_mode;\n\
+         SET SESSION sql_mode = TRIM(BOTH ',' FROM REPLACE(REPLACE(CONCAT(',', @@SESSION.sql_mode, ','), \
+         ',NO_ZERO_IN_DATE,', ','), ',NO_ZERO_DATE,', ','));\n\
+         {statement};\n\
+         SET SESSION sql_mode = @dbx_transfer_sql_mode"
+    ))
+}
+
 async fn execute_transfer_write_statement(
     state: &AppState,
     target_pool_key: &str,
@@ -2546,6 +2616,12 @@ async fn execute_transfer_write_statement(
     schema: &str,
     needs_identity_insert: bool,
 ) -> Result<(), String> {
+    if *target_db_type == DatabaseType::Mysql {
+        if let Some(wrapped) = mysql_zero_date_tolerant_write_sql(sql) {
+            execute_on_pool(state, target_pool_key, &wrapped).await?;
+            return Ok(());
+        }
+    }
     if !needs_identity_insert || !matches!(target_db_type, DatabaseType::Dameng | DatabaseType::SqlServer) {
         execute_on_pool(state, target_pool_key, sql).await?;
         return Ok(());
@@ -2824,6 +2900,7 @@ fn keeps_backslash_literal(target_db: &DatabaseType) -> bool {
         DatabaseType::Oracle
             | DatabaseType::OceanbaseOracle
             | DatabaseType::Dameng
+            | DatabaseType::Xugu
             | DatabaseType::Sqlite
             | DatabaseType::Rqlite
             | DatabaseType::Turso
@@ -2897,15 +2974,49 @@ fn format_mysql_default_literal(raw: &str, data_type: &str) -> String {
     format!("'{}'", trimmed.replace('\'', "''"))
 }
 
+fn dameng_to_postgres_default(value: &str, target_type: &str) -> Option<String> {
+    static STRING_LITERAL: std::sync::LazyLock<Regex> =
+        std::sync::LazyLock::new(|| Regex::new(r"\A'([^'\x00]|'')*'\z").expect("valid string literal regex"));
+    static TIMESTAMP_DEFAULT: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+        Regex::new(r"\A(?:CURRENT_TIMESTAMP|LOCALTIMESTAMP)(?:\([ \t]*[0-6][ \t]*\))?\z")
+            .expect("valid timestamp default regex")
+    });
+
+    // Dameng returns SQL expressions. Keep defaults with a PostgreSQL equivalent
+    // for the mapped column type, without copying Dameng functions or sequences.
+    let target_base_type = target_type.split('(').next().unwrap_or(target_type).trim();
+    let upper = value.to_ascii_uppercase();
+    match (target_base_type, upper.as_str()) {
+        (_, "NULL") => Some(upper),
+        ("BOOLEAN", "1" | "TRUE") => Some("TRUE".to_string()),
+        ("BOOLEAN", "0" | "FALSE") => Some("FALSE".to_string()),
+        ("DATE" | "TIMESTAMP", "CURRENT_DATE") => Some(upper),
+        ("DATE" | "TIMESTAMP", _) if TIMESTAMP_DEFAULT.is_match(&upper) => Some(upper),
+        ("SMALLINT", _) if value.parse::<i16>().is_ok() => Some(value.to_string()),
+        ("INTEGER", _) if value.parse::<i32>().is_ok() => Some(value.to_string()),
+        ("BIGINT", _) if value.parse::<i64>().is_ok() => Some(value.to_string()),
+        ("NUMERIC" | "DECIMAL" | "DOUBLE PRECISION", _) if looks_like_numeric_literal(value) => Some(value.to_string()),
+        ("VARCHAR" | "CHAR" | "TEXT", _) if STRING_LITERAL.is_match(value) => {
+            Some(quote_postgres_string_literal(&value[1..value.len() - 1].replace("''", "'")))
+        }
+        _ => None,
+    }
+}
+
 fn column_default_clause(
     column: &db::ColumnInfo,
     source_schema: &str,
     target_schema: &str,
     source_db: &DatabaseType,
     target_db: &DatabaseType,
+    target_type: &str,
 ) -> Option<String> {
     if is_postgres_compat_transfer(source_db, target_db) {
         return postgres_default_clause(column, source_schema, target_schema, source_db, target_db);
+    }
+    if matches!((source_db, target_db), (DatabaseType::Dameng, DatabaseType::Postgres)) {
+        let value = column.column_default.as_deref()?.trim();
+        return dameng_to_postgres_default(value, target_type).map(|value| format!("DEFAULT {value}"));
     }
     if is_mysql_family_target(target_db) {
         let default_value = column.column_default.as_deref()?.trim();
@@ -2915,6 +3026,44 @@ fn column_default_clause(
         return Some(format!("DEFAULT {}", format_mysql_default_literal(default_value, &column.data_type)));
     }
     None
+}
+
+fn mysql_default_for_dameng(column: &db::ColumnInfo) -> Option<String> {
+    static CURRENT_TIMESTAMP: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+        Regex::new(r"\ACURRENT_TIMESTAMP(?:\([0-6]?\))?\z").expect("valid timestamp default regex")
+    });
+    let value = column.column_default.as_deref()?;
+    let trimmed = value.trim();
+    let base_type = column.data_type.split(['(', ' ']).next().unwrap_or_default().to_ascii_lowercase();
+    let upper = trimmed.to_ascii_uppercase();
+    if matches!(base_type.as_str(), "timestamp" | "datetime") && CURRENT_TIMESTAMP.is_match(&upper) {
+        return Some(upper.strip_suffix("()").unwrap_or(&upper).to_string());
+    }
+    if column
+        .extra
+        .as_deref()
+        .is_some_and(|extra| extra.split_ascii_whitespace().any(|part| part.eq_ignore_ascii_case("DEFAULT_GENERATED")))
+    {
+        return None;
+    }
+
+    // COLUMN_DEFAULT is the raw string on MySQL. Quote it even when it looks
+    // like NULL or a function, and check integer bounds after type mapping.
+    let compatible_number = match base_type.as_str() {
+        "tinyint" => trimmed.parse::<i8>().is_ok(),
+        "smallint" => trimmed.parse::<i16>().is_ok(),
+        "mediumint" | "int" | "integer" => trimmed.parse::<i32>().is_ok(),
+        "bigint" => trimmed.parse::<i64>().is_ok(),
+        "numeric" | "decimal" | "double" => looks_like_numeric_literal(trimmed),
+        _ => false,
+    };
+    if compatible_number {
+        Some(trimmed.to_string())
+    } else if matches!(base_type.as_str(), "char" | "varchar") && !value.contains('\0') {
+        Some(quote_string_literal(value))
+    } else {
+        None
+    }
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -4937,7 +5086,38 @@ fn generate_create_table_ddl_with_column_quoting(
     catalog: Option<&str>,
     quote_target_column_names: bool,
 ) -> String {
+    generate_create_table_ddl_with_source_profile(
+        columns,
+        table,
+        source_schema,
+        schema,
+        target_db,
+        source_db,
+        None,
+        table_comment,
+        catalog,
+        quote_target_column_names,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn generate_create_table_ddl_with_source_profile(
+    columns: &[db::ColumnInfo],
+    table: &str,
+    source_schema: &str,
+    schema: &str,
+    target_db: &DatabaseType,
+    source_db: &DatabaseType,
+    source_driver_profile: Option<&str>,
+    table_comment: Option<&str>,
+    catalog: Option<&str>,
+    quote_target_column_names: bool,
+) -> String {
     let full_table = qualified_table(table, schema, target_db, catalog);
+    // MySQL-compatible profiles can return SQL literals instead of raw string values.
+    let preserve_mysql_defaults_in_dameng =
+        matches!((source_db, target_db), (DatabaseType::Mysql, DatabaseType::Dameng))
+            && matches!(source_driver_profile, None | Some("mysql"));
 
     let is_mysql_family = matches!(
         target_db,
@@ -5052,10 +5232,16 @@ fn generate_create_table_ddl_with_column_quoting(
                             || mysql_extra_clauses.as_ref().is_some_and(|extra| extra.auto_increment));
                     if !skip_default && !mysql_auto_increment {
                         if let Some(default_clause) =
-                            column_default_clause(c, source_schema, schema, source_db, target_db)
+                            column_default_clause(c, source_schema, schema, source_db, target_db, &mapped_type)
                         {
                             line.push(' ');
                             line.push_str(&default_clause);
+                        }
+                    }
+                    if preserve_mysql_defaults_in_dameng && !skip_default && !column_is_auto_increment(c) {
+                        if let Some(value) = mysql_default_for_dameng(c) {
+                            line.push_str(" DEFAULT ");
+                            line.push_str(&value);
                         }
                     }
                     if !c.is_nullable
@@ -5296,7 +5482,16 @@ impl InsertSqlTemplate {
         catalog: Option<&str>,
         overrides_postgres_system_values: bool,
     ) -> Self {
-        Self::new_with_column_quoting(columns, table, schema, db_type, catalog, overrides_postgres_system_values, true)
+        Self::new_with_column_quoting(
+            columns,
+            table,
+            schema,
+            db_type,
+            catalog,
+            overrides_postgres_system_values,
+            true,
+            None,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -5308,11 +5503,18 @@ impl InsertSqlTemplate {
         catalog: Option<&str>,
         overrides_postgres_system_values: bool,
         quote_target_column_names: bool,
+        identifier_quote: Option<&str>,
     ) -> Self {
-        let full_table = qualified_table(table, schema, db_type, catalog);
+        let full_table = qualified_table_with_explicit_quote(table, schema, db_type, catalog, identifier_quote);
         let col_list = columns
             .iter()
-            .map(|column| transfer_column_identifier(column, db_type, quote_target_column_names))
+            .map(|column| {
+                if uses_explicit_identifier_quote(db_type, identifier_quote) {
+                    quote_identifier_with_identifier_quote(column, db_type, identifier_quote)
+                } else {
+                    transfer_column_identifier(column, db_type, quote_target_column_names)
+                }
+            })
             .collect::<Vec<_>>()
             .join(", ");
         let overriding =
@@ -5817,6 +6019,7 @@ fn generate_upsert_typed_for_transfer(
                 catalog,
                 false,
                 quote_target_column_names,
+                None,
             );
             template.build(&value_rows_sql(rows, column_types, db_type, mysql_spatial_markers))
         }
@@ -6700,6 +6903,7 @@ fn generate_transfer_write_sql(
                 catalog,
                 overrides_postgres_system_values,
                 quote_target_column_names,
+                None,
             );
             template.build(&value_rows_sql(rows, column_types, db_type, mysql_spatial_markers))
         }
@@ -6733,7 +6937,7 @@ pub(crate) fn generate_insert_typed_sql_batches_from_value_rows(
     limits: SqlBatchLimits,
 ) -> Result<Vec<(String, usize)>, String> {
     generate_insert_typed_sql_batches_from_value_rows_with_options(
-        columns, value_rows, table, schema, db_type, catalog, limits, false,
+        columns, value_rows, table, schema, db_type, catalog, limits, false, None,
     )
 }
 
@@ -6747,10 +6951,20 @@ pub(crate) fn generate_insert_typed_sql_batches_from_value_rows_with_options(
     catalog: Option<&str>,
     limits: SqlBatchLimits,
     skip_duplicate_rows: bool,
+    identifier_quote: Option<&str>,
 ) -> Result<Vec<(String, usize)>, String> {
     if !skip_duplicate_rows {
         return generate_insert_sql_batches_from_value_rows(
-            columns, value_rows, table, schema, db_type, catalog, limits, false, true,
+            columns,
+            value_rows,
+            table,
+            schema,
+            db_type,
+            catalog,
+            limits,
+            false,
+            true,
+            identifier_quote,
         );
     }
 
@@ -6767,7 +6981,16 @@ pub(crate) fn generate_insert_typed_sql_batches_from_value_rows_with_options(
     let target_sql_bytes = limits.target_sql_bytes.max(1);
     let batch_sql_bytes = limits.hard_sql_bytes.map_or(target_sql_bytes, |hard| target_sql_bytes.min(hard));
 
-    let template = InsertSqlTemplate::new_with_column_quoting(columns, table, schema, db_type, catalog, false, true);
+    let template = InsertSqlTemplate::new_with_column_quoting(
+        columns,
+        table,
+        schema,
+        db_type,
+        catalog,
+        false,
+        true,
+        identifier_quote,
+    );
 
     let value_row_bytes = value_rows.iter().map(|row| sql_text_bytes(row, db_type)).collect::<Vec<_>>();
 
@@ -6875,6 +7098,7 @@ pub(crate) fn generate_primary_key_upsert_sql_batches_from_value_rows(
         adjusted_limits,
         false,
         true,
+        None,
     )?;
 
     batches
@@ -6930,6 +7154,7 @@ fn generate_insert_typed_sql_batches_for_transfer(
         limits,
         overrides_postgres_system_values,
         quote_target_column_names,
+        None,
     )
 }
 
@@ -6944,6 +7169,7 @@ fn generate_insert_sql_batches_from_value_rows(
     limits: SqlBatchLimits,
     overrides_postgres_system_values: bool,
     quote_target_column_names: bool,
+    identifier_quote: Option<&str>,
 ) -> Result<Vec<(String, usize)>, String> {
     if value_rows.is_empty() {
         return Ok(Vec::new());
@@ -6965,6 +7191,7 @@ fn generate_insert_sql_batches_from_value_rows(
         catalog,
         overrides_postgres_system_values,
         quote_target_column_names,
+        identifier_quote,
     );
     let value_row_bytes = value_rows.iter().map(|row| sql_text_bytes(row, db_type)).collect::<Vec<_>>();
     let mut statements = Vec::new();
@@ -9793,6 +10020,18 @@ pub fn should_transfer_schema_objects(
 /// outcome. Executes in dependency order (sequence → view → function →
 /// procedure → trigger → event). Errors are collected per object and the
 /// transfer continues.
+pub async fn check_data_charset_transfer(state: &AppState, request: &TransferRequest) -> Result<(), String> {
+    for connection_id in [&request.source_connection_id, &request.target_connection_id] {
+        crate::query::mysql_data_charset_policy::reject_operation(
+            state,
+            connection_id,
+            crate::query::mysql_data_charset_policy::TRANSFER_UNSUPPORTED,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
 pub async fn transfer_schema_objects<F>(
     state: &AppState,
     request: &TransferRequest,
@@ -9803,6 +10042,7 @@ pub async fn transfer_schema_objects<F>(
 where
     F: FnMut(TransferProgress),
 {
+    check_data_charset_transfer(state, request).await?;
     if request.has_package_selection() {
         let source_db_type = get_db_type(state, &request.source_connection_id).await?;
         let target_db_type = get_db_type(state, &request.target_connection_id).await?;
@@ -9862,6 +10102,7 @@ pub(crate) async fn transfer_schema_objects_with_routine_context<F>(
 where
     F: FnMut(TransferProgress),
 {
+    check_data_charset_transfer(state, request).await?;
     if matches!(request.content, TransferContent::DataOnly) && !request.has_package_selection() {
         return Ok(TransferObjectOutcome::default());
     }
@@ -10751,12 +10992,12 @@ fn postgres_table_dependency_selection_sql(schema: &str, tables: &[String]) -> O
              JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
              WHERE n.nspname = {source_schema} AND c.relkind IN ('r','p','f') AND c.relname IN ({table_list}) \
          ), selected_dependencies(classid, objid) AS ( \
-             SELECT 'pg_catalog.pg_class'::regclass, oid FROM selected_tables \
-             UNION SELECT 'pg_catalog.pg_attrdef'::regclass, a.oid \
+             SELECT 'pg_catalog.pg_class'::regclass::oid, oid FROM selected_tables \
+             UNION SELECT 'pg_catalog.pg_attrdef'::regclass::oid, a.oid \
              FROM pg_catalog.pg_attrdef a JOIN selected_tables t ON t.oid = a.adrelid \
-             UNION SELECT 'pg_catalog.pg_constraint'::regclass, c.oid \
+             UNION SELECT 'pg_catalog.pg_constraint'::regclass::oid, c.oid \
              FROM pg_catalog.pg_constraint c JOIN selected_tables t ON t.oid = c.conrelid \
-             UNION SELECT 'pg_catalog.pg_class'::regclass, i.indexrelid \
+             UNION SELECT 'pg_catalog.pg_class'::regclass::oid, i.indexrelid \
              FROM pg_catalog.pg_index i JOIN selected_tables t ON t.oid = i.indrelid \
              UNION \
              SELECT d.refclassid, d.refobjid \
@@ -11228,6 +11469,7 @@ async fn build_rebuild_preview(
                 })?;
             rename_statements.push(rename_sql);
             let drop_sql = crate::db_admin_sql::build_drop_table_sql(crate::db_admin_sql::TableAdminSqlOptions {
+                foreign_table: false,
                 database_type: Some(*target_db_type),
                 schema: if request.target_schema.is_empty() { None } else { Some(request.target_schema.clone()) },
                 table_name: backup.clone(),
@@ -11500,9 +11742,17 @@ async fn fetch_foreign_keys_for_tables(
     database: &str,
     schema: &str,
     tables: &[String],
+    cancel_transfer_id: Option<&str>,
 ) -> Result<HashMap<String, Vec<db::ForeignKeyInfo>>, String> {
     let mut result = HashMap::new();
     for table in tables {
+        // One metadata round trip per table: on a large schema this phase can run for
+        // minutes, so a cancel request must be honoured between tables.
+        if let Some(transfer_id) = cancel_transfer_id {
+            if is_cancelled(transfer_id).await {
+                return Err("Cancelled".to_string());
+            }
+        }
         let fks = crate::schema::list_foreign_keys_core(state, connection_id, database, schema, table).await?;
         result.insert(table.clone(), fks);
     }
@@ -11535,6 +11785,20 @@ pub async fn sort_tables_by_fk_dependency_with_foreign_keys(
     tables: &[String],
     parents_first: bool,
 ) -> Result<(Vec<String>, HashMap<String, Vec<db::ForeignKeyInfo>>), String> {
+    sort_tables_by_fk_dependency_cancellable(state, connection_id, database, schema, tables, parents_first, None).await
+}
+
+/// Same as `sort_tables_by_fk_dependency_with_foreign_keys`, but stops with `Err("Cancelled")`
+/// as soon as `cancel_transfer_id` is flagged cancelled while foreign keys are being fetched.
+pub async fn sort_tables_by_fk_dependency_cancellable(
+    state: &AppState,
+    connection_id: &str,
+    database: &str,
+    schema: &str,
+    tables: &[String],
+    parents_first: bool,
+    cancel_transfer_id: Option<&str>,
+) -> Result<(Vec<String>, HashMap<String, Vec<db::ForeignKeyInfo>>), String> {
     if tables.len() <= 1 {
         return Ok((tables.to_vec(), HashMap::new()));
     }
@@ -11559,7 +11823,7 @@ pub async fn sort_tables_by_fk_dependency_with_foreign_keys(
         (db::postgres::list_table_dependencies(&pool, schema).await?, HashMap::new())
     } else {
         let foreign_keys_by_table =
-            fetch_foreign_keys_for_tables(state, connection_id, database, schema, tables).await?;
+            fetch_foreign_keys_for_tables(state, connection_id, database, schema, tables, cancel_transfer_id).await?;
         let dependencies = foreign_keys_by_table
             .iter()
             .flat_map(|(table, fks)| fks.iter().map(move |fk| (table.clone(), fk.ref_table.clone())))
@@ -12433,6 +12697,7 @@ pub async fn rename_tables_to_backup<F>(
 where
     F: FnMut(TransferProgress),
 {
+    check_data_charset_transfer(state, request).await?;
     let source_pool_key = ensure_transfer_pool(
         state,
         &request.source_connection_id,
@@ -14158,6 +14423,7 @@ pub async fn drop_backup_tables(
     backup_names: &HashMap<String, String>,
     drop_order: &[String],
 ) -> Result<(), String> {
+    check_data_charset_transfer(state, request).await?;
     let mut ordered: Vec<&String> = drop_order.iter().filter(|table| backup_names.contains_key(*table)).collect();
     let mut leftovers: Vec<&String> = backup_names.keys().filter(|table| !drop_order.contains(*table)).collect();
     leftovers.sort();
@@ -14171,6 +14437,7 @@ pub async fn drop_backup_tables(
             continue;
         };
         let drop_sql = crate::db_admin_sql::build_drop_table_sql(crate::db_admin_sql::TableAdminSqlOptions {
+            foreign_table: false,
             database_type: Some(target_db_type),
             schema: if request.target_schema.is_empty() { None } else { Some(request.target_schema.clone()) },
             table_name: backup_name.clone(),
@@ -14272,6 +14539,7 @@ where
     F: FnMut(TransferProgress),
     C: FnMut(Option<u64>),
 {
+    check_data_charset_transfer(state, request).await?;
     validate_transfer_database_pair(request, source_db_type, target_db_type)?;
     let state = state.clone();
     if mysql_xugu::is_pair(source_db_type, target_db_type) {
@@ -15271,6 +15539,8 @@ for line in sys.stdin:
             show_system_schemas: false,
             sidebar_auto_load_all_tables: false,
             show_database_links: None,
+            show_native_jobs: None,
+            show_user_admin: None,
             attached_databases: Vec::new(),
             init_script: None,
             color: None,
@@ -15580,6 +15850,57 @@ CREATE TABLE "Other"."prefix""Source"."NAME" ("ID" INT);"#;
     }
 
     #[test]
+    fn xugu_transfer_preserves_text_and_json_escape_sequences() {
+        let values = [
+            "".to_string(),
+            r"C:\tmp\o'clock\".to_string(),
+            r"\\server\share\\file".to_string(),
+            "中文\nactual\ttab\r\nnext".to_string(),
+            r"literal\n\r\t\u4e2d".to_string(),
+            r#"{"path":"C:\\tmp\\o'clock","quoted":"\"value\"","newline":"a\nb","unicode":"\u4e2d"}"#.to_string(),
+            "中文\\'\"\n".repeat(25_000),
+        ];
+        for kind in [None, Some("VARCHAR(500)"), Some("CHAR(500)"), Some("CLOB"), Some("JSON"), Some("XML")] {
+            for text in &values {
+                assert_eq!(
+                    escape_value_typed(&json!(text), &DatabaseType::Xugu, kind),
+                    quote_string_literal(text),
+                    "Xugu literal must retain source characters for {kind:?}"
+                );
+            }
+            assert_eq!(escape_value_typed(&serde_json::Value::Null, &DatabaseType::Xugu, kind), "NULL");
+        }
+    }
+
+    #[test]
+    fn xugu_insert_preserves_text_without_modifying_binary_literals() {
+        let text = r"C:\tmp\o'clock\";
+        let document = r#"{"path":"C:\\tmp","line":"a\nb"}"#;
+        let sql = generate_insert_typed(
+            &["ID".into(), "V".into(), "L".into(), "J".into(), "B".into()],
+            &[
+                Some("INT".into()),
+                Some("VARCHAR(100)".into()),
+                Some("CLOB".into()),
+                Some("JSON".into()),
+                Some("BLOB".into()),
+            ],
+            &[vec![json!(1), json!(text), json!(text), json!(document), json!("0x005C27FF")]],
+            "ESCAPE_TEST",
+            "APP",
+            &DatabaseType::Xugu,
+            None,
+        );
+        assert_eq!(
+            sql,
+            format!(
+                "INSERT INTO \"APP\".\"ESCAPE_TEST\" (\"ID\", \"V\", \"L\", \"J\", \"B\") VALUES\n(1, {}, {}, {}, X'005C27FF')",
+                quote_string_literal(text), quote_string_literal(text), quote_string_literal(document)
+            )
+        );
+    }
+
+    #[test]
     fn h2_transfer_literals_preserve_json_binary_and_backslashes() {
         assert_eq!(
             escape_value_typed(&json!(r"C:\tmp\o'clock"), &DatabaseType::H2, Some("CHARACTER VARYING")),
@@ -15632,6 +15953,7 @@ CREATE TABLE "Other"."prefix""Source"."NAME" ("ID" INT);"#;
             deferred_large_value_cells: Vec::new(),
             column_sortables: Vec::new(),
             spatial_columns: vec![],
+            raw_key_cells: Vec::new(),
             spatial_values: vec![],
             rows,
             affected_rows: 0,
@@ -17369,6 +17691,19 @@ CREATE TABLE "Other"."prefix""Source"."NAME" ("ID" INT);"#;
             assert!(sql.contains("'ENUM'::text"));
             assert!(sql.contains("'DOMAIN'::text"));
             assert!(sql.contains("'EXTENSION'::text"));
+        }
+
+        #[test]
+        fn postgres_table_dependency_recursive_cte_unifies_classid_to_oid() {
+            let sql = postgres_table_dependency_selection_sql("public", &["orders".into()]).unwrap();
+            for needle in [
+                "SELECT 'pg_catalog.pg_class'::regclass::oid, oid FROM selected_tables",
+                "UNION SELECT 'pg_catalog.pg_attrdef'::regclass::oid, a.oid",
+                "UNION SELECT 'pg_catalog.pg_constraint'::regclass::oid, c.oid",
+                "UNION SELECT 'pg_catalog.pg_class'::regclass::oid, i.indexrelid",
+            ] {
+                assert!(sql.contains(needle));
+            }
         }
 
         #[test]
@@ -23461,6 +23796,7 @@ SELECT 1 FROM dual"#
             None,
             SqlBatchLimits { max_rows: 100, target_sql_bytes: 1024, hard_sql_bytes: None },
             true,
+            None,
         )
         .unwrap();
 
@@ -23482,6 +23818,7 @@ SELECT 1 FROM dual"#
             None,
             SqlBatchLimits { max_rows: 100, target_sql_bytes: 1024, hard_sql_bytes: None },
             true,
+            None,
         )
         .unwrap();
 
@@ -23504,6 +23841,7 @@ SELECT 1 FROM dual"#
             None,
             SqlBatchLimits { max_rows: 100, target_sql_bytes: 1024, hard_sql_bytes: None },
             true,
+            None,
         )
         .unwrap();
 
@@ -23563,6 +23901,8 @@ SELECT 1 FROM dual"#
             show_system_schemas: false,
             sidebar_auto_load_all_tables: false,
             show_database_links: None,
+            show_native_jobs: None,
+            show_user_admin: None,
             attached_databases: Vec::new(),
             init_script: None,
             color: None,
@@ -24388,6 +24728,32 @@ SELECT 1 FROM dual"#
     #[test]
     fn parse_mysql_row_error_returns_none_for_non_mysql_error() {
         assert_eq!(parse_mysql_row_error("some other error"), None);
+    }
+
+    #[test]
+    fn mysql_zero_date_write_sql_relaxes_only_zero_date_flags_around_the_batch() {
+        let insert = "INSERT INTO `t` (`id`, `d`) VALUES (1, '2026-11-10'), (2, '0000-00-00 00:00:00');";
+        let wrapped = mysql_zero_date_tolerant_write_sql(insert).expect("zero date batch is wrapped");
+        assert_eq!(
+            wrapped,
+            "SET @dbx_transfer_sql_mode = @@SESSION.sql_mode;\n\
+             SET SESSION sql_mode = TRIM(BOTH ',' FROM REPLACE(REPLACE(CONCAT(',', @@SESSION.sql_mode, ','), \
+             ',NO_ZERO_IN_DATE,', ','), ',NO_ZERO_DATE,', ','));\n\
+             INSERT INTO `t` (`id`, `d`) VALUES (1, '2026-11-10'), (2, '0000-00-00 00:00:00');\n\
+             SET SESSION sql_mode = @dbx_transfer_sql_mode"
+        );
+        assert!(mysql_zero_date_tolerant_write_sql("INSERT INTO t VALUES ('2026-00-00')").is_some());
+        assert!(mysql_zero_date_tolerant_write_sql("INSERT INTO t VALUES ('2026-05-00 08:00:00')").is_some());
+    }
+
+    #[test]
+    fn mysql_zero_date_write_sql_leaves_ordinary_batches_unchanged() {
+        assert_eq!(
+            mysql_zero_date_tolerant_write_sql(
+                "INSERT INTO t VALUES ('2026-11-10 00:00:00', '2000-10-01', 'code 1000-00', 20260000)"
+            ),
+            None
+        );
     }
 
     #[test]

@@ -6,7 +6,8 @@ import { useExportTracker } from "@/composables/useExportTracker";
 import { filterSchemaDiffTables } from "@/lib/schema/schemaDiffTableFilter";
 import { compileSchemaDiffTableFilter } from "@/lib/schema/schemaDiffTableFilter";
 import { filterSchemaDiffFunctions, schemaDiffRoutineKeyFromFunction } from "@/lib/schema/schemaDiffRoutine";
-import { loadSchemaDetails } from "@/lib/schema/schemaDiffMetadataLoad";
+import { loadSchemaDetails, schemaDiffDeferredDdlTables } from "@/lib/schema/schemaDiffMetadataLoad";
+import { invalidateObjectMetadataCache } from "@/lib/metadata/objectMetadataCache";
 import { registerSchemaDiffTask } from "@/lib/schema/schemaDiffCancellation";
 import type { SchemaDiffTableIdentity, SchemaDiffTableListLoader } from "@/lib/schema/schemaDiffTableList";
 import { getSchemaDiffNextProgressStep, isSchemaDiffPostgresLike, shouldLoadSchemaDiffExtraObjectPhase, shouldLoadSchemaDiffRoutines, type SchemaDiffProgressPhase } from "@/lib/schema/schemaDiffProgress";
@@ -204,6 +205,17 @@ async function runSchemaDiffSession(session: SchemaDiffSession, dependencies: Sc
       signal.throwIfAborted();
       ({ sourceTables, targetTables } = filterSchemaDiffTables(sourceTableList, targetTableList, tableFilter, sessionOptions, sessionOptions.selectedTables));
 
+      // Column/index/foreign-key reads are served from the persisted object
+      // metadata cache, which has no TTL on the backend. A compare must see the
+      // live structure on both sides, otherwise changes made outside DBX are
+      // hidden behind a stale snapshot. Best effort: a failed deletion only
+      // means the compare falls back to whatever the cache returns. Users can
+      // opt out via `refreshMetadata` to reuse the cache for faster compares.
+      if (sessionOptions.refreshMetadata) {
+        await Promise.all([invalidateObjectMetadataCache({ connectionId: input.sourceConnectionId, database: input.sourceDatabase }), invalidateObjectMetadataCache({ connectionId: input.targetConnectionId, database: input.targetDatabase })]);
+        signal.throwIfAborted();
+      }
+
       publishProgress(session, { phase: "loading-source-details", current: 0, total: sourceTables.length });
       sourceDetails = await loadSchemaDetails(
         sourceTables,
@@ -213,6 +225,7 @@ async function runSchemaDiffSession(session: SchemaDiffSession, dependencies: Sc
           schema: input.sourceSchema,
           dbType: input.sourceDbType,
           options: sessionOptions,
+          deferredDdlTables: schemaDiffDeferredDdlTables(input.sourceDbType, sourceTables, targetTables, sessionOptions.tableMappings),
           signal,
           onProgress: (progress) => publishProgress(session, { phase: "loading-source-details", ...progress }),
         },
@@ -229,6 +242,7 @@ async function runSchemaDiffSession(session: SchemaDiffSession, dependencies: Sc
           schema: input.targetSchema,
           dbType: input.targetDbType,
           options: sessionOptions,
+          deferredDdlTables: schemaDiffDeferredDdlTables(input.targetDbType, sourceTables, targetTables, sessionOptions.tableMappings),
           signal,
           onProgress: (progress) => publishProgress(session, { phase: "loading-target-details", ...progress }),
         },
@@ -444,6 +458,9 @@ export function schemaDiffSessionObjects(result: SchemaDiffPreparation | null, d
   if (!result) return [];
   const objects = convertToSchemaDiffObjects(result.diffs, result.functionDiffs, result.sequenceDiffs, result.ruleDiffs, result.ownerDiffs, result.renameCandidates);
   for (const object of objects) {
+    // Keep target-only table drops out of the initial deployment plan.
+    if (object.objectKind === "table" && object.operationType === "delete") object.selected = false;
+
     const draft = deployment?.drafts.find((draft) => draft.objectId === object.id);
     if (draft?.sql?.trim() && draft.action !== "delete" && (object.operationType === "delete" || (object.operationType === "none" && draft.reviewedTargetDraft))) {
       object.operationType = draft.action === "replace" ? "modify" : "create";

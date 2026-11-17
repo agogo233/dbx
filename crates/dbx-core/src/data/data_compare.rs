@@ -26,6 +26,21 @@ use super::sample_pairing::retain_shared_sample_rows_by_key;
 const DATA_SYNC_INSERT_BATCH_SIZE: usize = 500;
 const DATA_SYNC_CONDITION_BATCH_SIZE: usize = 200;
 
+/// 数据比对的查询选项：查询超时跟随连接配置（0 = 不限时），而不是
+/// `QueryExecutionOptions` 默认的 30 秒。大表比较（行计数、批量读取、采样）
+/// 常常超过 30 秒，用户调大连接的查询超时后即可完成（#13330）。
+async fn compare_query_options(
+    state: &AppState,
+    connection_id: &str,
+    max_rows: Option<usize>,
+) -> QueryExecutionOptions {
+    let timeout_secs = {
+        let configs = state.configs.read().await;
+        configs.get(connection_id).map(|config| config.effective_query_timeout_secs())
+    };
+    QueryExecutionOptions { max_rows, timeout_secs, ..Default::default() }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CompareDataRowsOptions {
@@ -359,7 +374,7 @@ pub async fn prepare_data_compare_from_tables(
             &source_count_sql,
             Some(&options.source_schema),
             None,
-            QueryExecutionOptions { max_rows: Some(1), ..Default::default() },
+            compare_query_options(state, &options.source_connection_id, Some(1)).await,
         ),
         execute_sql_statement_with_options(
             state,
@@ -368,7 +383,7 @@ pub async fn prepare_data_compare_from_tables(
             &target_count_sql,
             Some(&options.target_schema),
             None,
-            QueryExecutionOptions { max_rows: Some(1), ..Default::default() },
+            compare_query_options(state, &options.target_connection_id, Some(1)).await,
         )
     )?;
     let source_row_count = first_count(&source_count_result.rows)?;
@@ -554,7 +569,7 @@ pub async fn prepare_data_compare_missing_target(
         &source_count_sql,
         Some(&options.source_schema),
         None,
-        QueryExecutionOptions { max_rows: Some(1), ..Default::default() },
+        compare_query_options(state, &options.source_connection_id, Some(1)).await,
     )
     .await?;
     let source_row_count = first_count(&source_count_result.rows)?;
@@ -1272,6 +1287,19 @@ fn build_data_compare_select_sql(
                 "WITH {page_alias} AS (SELECT {select_columns}, ROW_NUMBER() OVER (ORDER BY {order_expression}) AS {row_number_alias} FROM {table}) SELECT {select_columns} FROM {page_alias} WHERE {row_number_alias} > {offset} AND {row_number_alias} <= {end} ORDER BY {row_number_alias}"
             )
         }
+        TablePaginationStrategy::TeradataTop => {
+            if offset == 0 {
+                return format!("SELECT TOP {row_limit} {select_columns} FROM {table}{order_by}");
+            }
+            // The window specification needs an ORDER BY. Compares select key columns
+            // before paging, so `order_by` is normally ` ORDER BY ...`; `ORDER BY 1`
+            // keeps the SQL valid if a keyless compare ever reaches this arm.
+            let window = if order_by.is_empty() { "ORDER BY 1" } else { order_by.trim() };
+            let end = offset + row_limit;
+            format!(
+                "SELECT * FROM (SELECT {select_columns}, ROW_NUMBER() OVER ({window}) AS \"__dbx_row_num\" FROM {table}) \"dbx_page\" WHERE \"__dbx_row_num\" > {offset} AND \"__dbx_row_num\" <= {end} ORDER BY \"__dbx_row_num\""
+            )
+        }
         TablePaginationStrategy::IrisTop => {
             build_iris_table_select_sql(&select_columns, &table, "", &order_by, row_limit, offset as u64)
         }
@@ -1432,7 +1460,7 @@ async fn fetch_compare_rows_by_offset(
             &sql,
             Some(schema),
             None,
-            QueryExecutionOptions { max_rows: Some(batch_size), ..Default::default() },
+            compare_query_options(state, connection_id, Some(batch_size)).await,
         )
         .await?;
         let fetched = result.rows.len();
@@ -1486,7 +1514,7 @@ async fn fetch_compare_rows_by_key(
             &sql,
             Some(schema),
             None,
-            QueryExecutionOptions { max_rows: Some(batch_size), ..Default::default() },
+            compare_query_options(state, connection_id, Some(batch_size)).await,
         )
         .await?;
         let fetched = result.rows.len();
@@ -2046,7 +2074,7 @@ async fn fetch_sampled_compare_rows(
         &sql,
         Some(schema),
         None,
-        QueryExecutionOptions { max_rows: Some(sample_size), ..Default::default() },
+        compare_query_options(state, connection_id, Some(sample_size)).await,
     )
     .await?;
 
@@ -2177,6 +2205,41 @@ mod tests {
 
     fn data_compare_column_with_extra(name: &str, data_type: &str, extra: &str) -> DataGridColumnInfo {
         DataGridColumnInfo { extra: Some(extra.to_string()), ..data_compare_column(name, data_type) }
+    }
+
+    #[tokio::test]
+    async fn compare_query_options_follows_connection_query_timeout() {
+        // #13330: compare queries used to run on the 30-second default regardless of
+        // the connection's configured query timeout, so large tables could never
+        // finish. The compare options must carry the connection's setting, with an
+        // explicit 0 meaning "no limit".
+        let directory = tempfile::tempdir().unwrap();
+        let storage = crate::persistence::test_storage::open(&directory.path().join("state.db")).await.unwrap();
+        let state = AppState::new(storage);
+        let config: crate::models::connection::ConnectionConfig = serde_json::from_value(json!({
+            "id": "compare-timeout",
+            "name": "compare timeout",
+            "db_type": DatabaseType::Mysql,
+            "host": "localhost",
+            "port": 3306,
+            "username": "root",
+            "password": "",
+            "query_timeout_secs": 0,
+        }))
+        .unwrap();
+        state.configs.write().await.insert(config.id.clone(), config);
+
+        let unlimited = compare_query_options(&state, "compare-timeout", Some(500)).await;
+        assert_eq!(unlimited.timeout_secs, Some(0));
+
+        state.configs.write().await.get_mut("compare-timeout").unwrap().query_timeout_secs = 120;
+        let configured = compare_query_options(&state, "compare-timeout", Some(500)).await;
+        assert_eq!(configured.timeout_secs, Some(120));
+
+        // An unknown connection keeps the historical 30-second default instead of
+        // silently dropping the timeout.
+        let unknown = compare_query_options(&state, "missing", Some(500)).await;
+        assert_eq!(unknown.timeout_secs, None);
     }
 
     #[test]
@@ -3392,6 +3455,36 @@ mod tests {
                 0,
             ),
             "SELECT TOP (50) [id], [name] FROM [dbo].[users] ORDER BY [id] ASC"
+        );
+    }
+
+    #[test]
+    fn builds_backend_table_select_sql_for_teradata_top_and_row_number_pages() {
+        // #14604: Teradata rejects `LIMIT`; bounded reads cap with `TOP n` and page
+        // past the first batch through a `ROW_NUMBER()` derived table.
+        assert_eq!(
+            build_data_compare_select_sql(
+                DatabaseType::Teradata,
+                "sales",
+                "orders",
+                &["id".to_string(), "name".to_string()],
+                &["id".to_string()],
+                500,
+                0,
+            ),
+            "SELECT TOP 500 \"id\", \"name\" FROM \"sales\".\"orders\" ORDER BY \"id\" ASC"
+        );
+        assert_eq!(
+            build_data_compare_select_sql(
+                DatabaseType::Teradata,
+                "sales",
+                "orders",
+                &["id".to_string(), "name".to_string()],
+                &["id".to_string()],
+                500,
+                500,
+            ),
+            "SELECT * FROM (SELECT \"id\", \"name\", ROW_NUMBER() OVER (ORDER BY \"id\" ASC) AS \"__dbx_row_num\" FROM \"sales\".\"orders\") \"dbx_page\" WHERE \"__dbx_row_num\" > 500 AND \"__dbx_row_num\" <= 1000 ORDER BY \"__dbx_row_num\""
         );
     }
 

@@ -19,20 +19,36 @@ import {
   filterSidebarTreeToConnectedConnections,
   findNodePathByIdentity,
   mergeSidebarRegexIndexScopes,
+  qualifiedTableQueryMatchesScope,
   resolveSidebarFilterGuards,
+  splitQualifiedTableQuery,
   type SidebarRegexIndexScope,
   type SidebarRegexScopeIdentity,
   localTableSearchParentTypes,
 } from "@/lib/sidebar/sidebarSearchTree";
 import { createSidebarLabelMatcher } from "@/lib/sidebar/sidebarSearch";
+import { filterConnectionIndexes, hideSimpleSidebarIndexes, insertConnectionIndexSearchControls } from "@/lib/sidebar/sidebarIndexSearch";
 import { firstSidebarSearchMatchDataNode, hasActiveSidebarSearch } from "@/lib/sidebar/sidebarSearchEnter";
 import { collectSidebarRegexIndexScopes } from "@/lib/sidebar/sidebarRegexSearchIndex";
 import { collectSidebarGlobalSearchIndexes, sidebarIndexedObjectGroupTypes } from "@/lib/sidebar/sidebarGlobalSearchIndex";
+import { runSidebarSearchTasks } from "./sidebarSearchTaskRunner";
 import { resolveSidebarSearchDatabaseScope } from "@/lib/sidebar/sidebarSearchDatabaseScope";
 import { useSidebarSearchIndexes } from "@/composables/useSidebarSearchIndexes";
 import { useSidebarRemoteSearch } from "@/composables/useSidebarRemoteSearch";
 import { collectSidebarRemoteSearchResults, mergeSidebarRemoteSearchResults, type SidebarRemoteSearchResult } from "@/lib/sidebar/sidebarRemoteSearch";
-import { isCancelSearchShortcut, isCopySidebarSelectionShortcut, isDisconnectSidebarConnectionShortcut, isEditSidebarConnectionShortcut, isEditSidebarTableStructureShortcut, isPasteSidebarSelectionShortcut, isRefreshDataShortcut, isViewTableDdlShortcut } from "@/lib/editor/keyboardShortcuts";
+import {
+  isCancelSearchShortcut,
+  isCopySidebarSelectionShortcut,
+  isCreateSidebarTableShortcut,
+  isCreateSidebarDatabaseShortcut,
+  isDisconnectSidebarConnectionShortcut,
+  isEditSidebarConnectionShortcut,
+  isEditSidebarTableStructureShortcut,
+  isFocusSearchShortcut,
+  isPasteSidebarSelectionShortcut,
+  isRefreshDataShortcut,
+  isViewTableDdlShortcut,
+} from "@/lib/editor/keyboardShortcuts";
 import { sidebarNodeSupportsDdlView } from "@/lib/sidebar/sidebarTreeDdlShortcut";
 import { DEFAULT_DATABASE_TREE_LABEL, hasTreeNodeDatabaseContext } from "@/lib/sidebar/treeNodeContext";
 import { objectSourceTargetForTreeNode } from "@/lib/sidebar/treeNodeClick";
@@ -54,7 +70,7 @@ import {
   findSidebarNodeForTarget,
   findNodePathForTarget,
   scrollTopForSidebarNode,
-  shouldScrollActiveSidebarSelection,
+  ActiveTabSidebarRevealTracker,
   type ActiveTabSidebarTarget,
   type SidebarNodeScrollAlign,
 } from "@/lib/sidebar/sidebarActiveTabTarget";
@@ -63,7 +79,7 @@ import { createFlatTreeIndex, flatTreeRowsChanged, getSidebarTreeRowHeight, SIDE
 import { sidebarTreeContextKey } from "@/lib/sidebar/sidebarTreeContext";
 import { createSidebarTreeRuntime, sidebarTreeRuntimeKey, type SidebarTreeRuntimeHostInstance } from "@/lib/sidebar/sidebarTreeRuntime";
 import { createSidebarPasteHandlerRegistry } from "@/lib/sidebar/sidebarPasteHandlerRegistry";
-import { insertSidebarTableSearchControls, isSidebarTableSearchControlNode, sidebarSearchableObjectGroupTypes } from "@/lib/sidebar/sidebarTableSearchControl";
+import { insertSidebarTableSearchControls, isSidebarTableSearchControlNode, parentHasSearchableTableList, resolveLocalTableSearchParent, sidebarSearchableObjectGroupTypes, tableSearchControlId } from "@/lib/sidebar/sidebarTableSearchControl";
 import { createSidebarTableSearchDebouncer, scheduleExclusiveSidebarTableSearchDebounce } from "@/lib/sidebar/sidebarTableSearchIndex";
 import TreeItem from "./TreeItem.vue";
 import ProductionContextBadge from "@/components/common/ProductionContextBadge.vue";
@@ -97,6 +113,8 @@ import { resetSidebarTreeDialogState } from "./sidebarTreeDialogState";
 import type { OracleTriggerSqlBinding } from "@/lib/database/oracleTriggerSql";
 import { SidebarDdlViewDialog, SidebarElasticsearchIndexMetadataDialog, SidebarObjectSourceDialog, SidebarProcedureExecutionDialog, SidebarVisibleDatabasesDialog, SidebarVisibleNacosNamespacesDialog, SidebarVisibleSchemasDialog } from "./sidebarAsyncDialogs";
 import { sortConnectionListForDisplay } from "@/lib/sidebar/connectionListSort";
+import { connectionEndpointUserLabel } from "@/lib/connection/connectionPresentation";
+import { orderSidebarConnectionUtilitiesForDisplay } from "@/lib/sidebar/sidebarNodeOrdering";
 import { sidebarDisplayTableName } from "@/lib/sidebar/sidebarTableNameDisplay";
 import { sidebarTreeDisplayLabel, sidebarTreeSecondaryValue } from "@/lib/sidebar/sidebarTreeLabel";
 import { canTreeNodePin, sidebarPinnedActionSlotWidthPx, alignedSidebarCommentLabelWidths, isSidebarCommentAlignableNode, sidebarTreeNaturalContentWidth, sidebarTreeNodeComment, usesFullWidthTreeLabel } from "@/lib/sidebar/sidebarTreeItemLayout";
@@ -114,10 +132,15 @@ const store = useConnectionStore();
 const queryStore = useQueryStore();
 const savedSqlStore = useSavedSqlStore();
 const settingsStore = useSettingsStore();
+const connectionIndexSearchQueries = ref<Record<string, string>>({});
+const indexSearchConnectionIds = computed(() => new Set(store.connections.filter((connection) => connection.db_type === "elasticsearch" || connection.db_type === "easysearch").map((connection) => connection.id)));
 const { toast } = useToast();
 const searchQuery = ref("");
 const deferredSearchQuery = ref("");
 const regexMode = ref(false);
+// The saved preference applies to the top search only; database-inline searches
+// retain their local/remote contracts. Regex continues to override plain text.
+const searchMatchMode = computed(() => settingsStore.editorSettings.sidebarSearchMatchMode);
 store.sidebarSearchQuery = "";
 const showConnectedConnectionsOnly = ref(false);
 const isDisconnectingAllActiveConnections = ref(false);
@@ -189,6 +212,7 @@ const sidebarObjectSourceFormatDialect = computed(() => sqlFormatDialectForDbTyp
 type SearchScope = "connection" | "database" | "schema" | "table" | "view";
 const selectedSearchScopes = ref<SearchScope[]>([]);
 const searchCollapsedIds = ref<Set<string>>(new Set());
+const searchExpandedIds = ref<Set<string>>(new Set());
 let searchTimer: number | undefined;
 const remoteTableSearchDebouncer = createSidebarTableSearchDebouncer();
 // Local-mode table searches debounce like remote ones: rapid typing coalesces
@@ -214,11 +238,18 @@ type TableSearchFocusRestore = {
   selection: TableSearchSelection | null;
 };
 
+function resetSearchExpandedIdsForQueryChange(value: string, previousValue: string) {
+  const normalized = regexMode.value ? value.trim() : value.trim().toLowerCase();
+  const previousNormalized = regexMode.value ? previousValue.trim() : previousValue.trim().toLowerCase();
+  if (!normalized || normalized !== previousNormalized) searchExpandedIds.value = new Set();
+}
+
 watch(
   searchQuery,
-  (value) => {
+  (value, previousValue) => {
     const normalized = regexMode.value ? value.trim() : value.trim().toLowerCase();
     window.clearTimeout(searchTimer);
+    resetSearchExpandedIdsForQueryChange(value, previousValue);
 
     if (!normalized) {
       deferredSearchQuery.value = "";
@@ -336,15 +367,26 @@ const connectionListSortMenuItems = computed(() => [
 ]);
 
 const isConnectionListAlphabeticallySorted = computed(() => settingsStore.editorSettings.sidebarConnectionSortMode !== "manual");
-const sidebarListOptionsLabel = computed(() => `${t("sidebar.sortConnections")} / ${t("sidebar.filterByType")}`);
+const sidebarListOptionsLabel = computed(() => t("sidebar.listOptions"));
 const sidebarListOptionItems = computed(() => [
+  ...(["fuzzy", "contains", "exact"] as const).map((mode, index) => ({
+    value: `match:${mode}`,
+    label: t(mode === "fuzzy" ? "sidebar.searchMatchModeFuzzy" : mode === "exact" ? "sidebar.searchMatchModeExact" : "sidebar.searchMatchModeContains"),
+    groupLabel: index === 0 ? t("sidebar.searchMatchMode") : undefined,
+    tooltip: t(mode === "exact" ? "sidebar.searchMatchModeExact" : "sidebar.searchMatchModeTooltip"),
+    role: "menuitemradio" as const,
+    disabled: regexMode.value,
+  })),
   ...connectionListSortMenuItems.value.map((item, index) => ({
     ...item,
     value: `sort:${item.value}`,
+    role: "menuitemradio" as const,
+    separatorBefore: index === 0,
     groupLabel: index === 0 ? t("sidebar.sortConnections") : undefined,
   })),
   ...searchScopeOptions.value.map((item, index) => ({
     value: `scope:${item.scope}`,
+    role: "menuitemcheckbox" as const,
     label: item.label,
     icon: item.icon,
     separatorBefore: index === 0,
@@ -360,8 +402,20 @@ const sidebarListOptionItems = computed(() => [
         },
       ]
     : []),
+  {
+    value: "opened-databases",
+    label: t("settings.sidebarSearchOpenedDatabasesOnly"),
+    role: "menuitemcheckbox" as const,
+    separatorBefore: true,
+    disabled: regexMode.value || settingsStore.editorSettings.sidebarGlobalSearchLocal,
+  },
 ]);
-const selectedSidebarListOptions = computed(() => [`sort:${settingsStore.editorSettings.sidebarConnectionSortMode}`, ...selectedSearchScopes.value.map((scope) => `scope:${scope}`)]);
+const selectedSidebarListOptions = computed(() => [
+  `match:${searchMatchMode.value}`,
+  `sort:${settingsStore.editorSettings.sidebarConnectionSortMode}`,
+  ...selectedSearchScopes.value.map((scope) => `scope:${scope}`),
+  ...(settingsStore.editorSettings.sidebarSearchOpenedDatabasesOnly ? ["opened-databases"] : []),
+]);
 const hasCustomSidebarListOptions = computed(() => isConnectionListAlphabeticallySorted.value || hasSearchScopeFilter.value);
 
 function updateConnectionListSortMode(mode: string) {
@@ -392,6 +446,16 @@ function toggleSearchScope(scope: SearchScope) {
 }
 
 function selectSidebarListOption(value: string) {
+  if (value === "opened-databases") {
+    if (!regexMode.value && !settingsStore.editorSettings.sidebarGlobalSearchLocal) {
+      settingsStore.updateEditorSettings({ sidebarSearchOpenedDatabasesOnly: !settingsStore.editorSettings.sidebarSearchOpenedDatabasesOnly });
+    }
+    return;
+  }
+  if (value === "match:fuzzy" || value === "match:contains" || value === "match:exact") {
+    if (!regexMode.value) settingsStore.updateEditorSettings({ sidebarSearchMatchMode: value === "match:exact" ? "exact" : value === "match:contains" ? "contains" : "fuzzy" });
+    return;
+  }
   if (value.startsWith("sort:")) {
     updateConnectionListSortMode(value.slice("sort:".length));
     return;
@@ -464,7 +528,9 @@ function restoreTableSearchInput(focusRestore: TableSearchFocusRestore) {
     // Filtering can move the old scroll position into another database/schema.
     // Reveal the edited scope before looking for its input: the original row
     // may not even be mounted in the virtual renderer at the old position.
-    const pinnedSearchIsVisible = stickyTableSearchNode.value?.node.tableSearchParentId === focusRestore.parentNodeId && !stickyHeaderStyle.value.transform;
+    const connectionHeaderHeight = root.querySelector(".sticky-connection-header")?.getBoundingClientRect().height ?? 0;
+    const headerClearance = Number.parseFloat(String(stickyHeaderStyle.value["--sticky-header-clearance"] ?? "Infinity"));
+    const pinnedSearchIsVisible = stickyTableSearchNode.value?.node.tableSearchParentId === focusRestore.parentNodeId && headerClearance >= connectionHeaderHeight;
     const searchIndex = flatNodes.value.findIndex(({ node }) => isSidebarTableSearchControlNode(node) && node.tableSearchParentId === focusRestore.parentNodeId);
     if (searchIndex < 0) return;
     const scroller = currentTreeScroller();
@@ -475,7 +541,7 @@ function restoreTableSearchInput(focusRestore: TableSearchFocusRestore) {
         viewportHeight: scroller.clientHeight,
         scrollHeight: scroller.scrollHeight,
         rowHeight: sidebarTreeRowHeight.value,
-        topOcclusionHeight: sidebarTreeRowHeight.value,
+        topOcclusionHeight: sidebarTreeRowHeight.value + connectionHeaderHeight,
         align: "nearest",
       });
       updateSidebarScrollMetrics();
@@ -509,37 +575,54 @@ function restoreTableSearchInput(focusRestore: TableSearchFocusRestore) {
   });
 }
 
-const userAdminVisibility = computed(() => sidebarUserAdminVisibility(store.treeNodes, settingsStore.editorSettings.sidebarShowUserAdmin !== false));
-const displayedTreeNodes = computed(() => sortConnectionListForDisplay(userAdminVisibility.value.nodes, settingsStore.editorSettings.sidebarConnectionSortMode));
+const userAdminVisibility = computed(() => sidebarUserAdminVisibility(store.treeNodes, store.getConfig, store.connections));
+const displayedTreeNodes = computed(() => sortConnectionListForDisplay(orderSidebarConnectionUtilitiesForDisplay(userAdminVisibility.value.nodes), settingsStore.editorSettings.sidebarConnectionSortMode));
 const localTableSearchResults = ref<Record<string, TableInfo[] | null>>({});
 const localTableSearchRequestRevisions = new Map<string, number>();
 type InvalidatedTableSearchScope = SidebarRegexScopeIdentity & { parentNodeId: string };
 const pendingInvalidatedTableSearchScopes = new Map<string, InvalidatedTableSearchScope>();
+function globalSearchConnectionRoots() {
+  return [...store.connectedIds].flatMap((connectionId) => {
+    const path = findNodePathByIdentity(store.treeNodes, connectionId, { connectionId, database: "", nodeType: "connection" });
+    const root = path?.[path.length - 1];
+    return root ? [{ connectionId, root }] : [];
+  });
+}
+
 const globalSearchContext = [
   () => regexMode.value,
+  () => settingsStore.editorSettings.sidebarSearchMatchMode,
   () => settingsStore.editorSettings.sidebarGlobalSearchLocal,
   () => settingsStore.editorSettings.sidebarObjectDisplay,
   () => settingsStore.editorSettings.sidebarSearchOpenedDatabasesOnly,
-  () => store.activeConnectionId,
   () => [...store.connectedIds].sort().join("\0"),
   () => [...queryStore.openDatabaseKeys].sort().join("\0"),
   () => {
     if (!settingsStore.editorSettings.sidebarSearchOpenedDatabasesOnly) return "";
-    const connectionId = store.activeConnectionId;
-    if (!connectionId) return "";
-    const rootPath = findNodePathByIdentity(store.treeNodes, connectionId, { connectionId, database: "", nodeType: "connection" });
-    const root = rootPath?.[rootPath.length - 1];
-    if (!root) return "";
-    const scope = resolveSidebarSearchDatabaseScope(root, { enabled: true, isChildrenLoaded: store.isTreeNodeChildrenLoaded, openDatabaseKeys: queryStore.openDatabaseKeys });
     // Tree-only opens do not change editor tab keys. Observe scope membership,
     // not descendant metadata or expansion flags, to avoid restarting builds.
-    return JSON.stringify([...(scope ?? [])].sort());
+    return JSON.stringify(
+      globalSearchConnectionRoots().map(({ connectionId, root }) => {
+        const scope = resolveSidebarSearchDatabaseScope(root, { enabled: true, isChildrenLoaded: store.isTreeNodeChildrenLoaded, openDatabaseKeys: queryStore.openDatabaseKeys });
+        return [connectionId, [...(scope ?? [])].sort()];
+      }),
+    );
   },
   () => store.sidebarTableSearchIndexInvalidation.revision,
   () => selectedSearchScopes.value.join(","),
 ];
+const qualifiedGlobalSearch = computed(() => {
+  if (regexMode.value || !deferredSearchQuery.value) return null;
+  return splitQualifiedTableQuery(deferredSearchQuery.value);
+});
+
+// The query only gates whether an index build happens (filtering is client-side
+// and the cache key is query-independent), so pass the bare object name and let
+// the schema qualifier narrow the results here.
+const globalIndexSearchQuery = computed(() => qualifiedGlobalSearch.value?.name ?? deferredSearchQuery.value);
+
 const { scopes: globalTableSearchScopes, isLoading: isGlobalIndexLoading } = useSidebarSearchIndexes({
-  query: deferredSearchQuery,
+  query: globalIndexSearchQuery,
   context: globalSearchContext,
   load: loadGlobalTableSearchIndexes,
   onError: (error) => toast(error instanceof Error ? error.message : String(error), 5000),
@@ -558,22 +641,24 @@ const {
 const isSidebarSearchLoading = computed(() => isGlobalIndexLoading.value || isRemoteSearchLoading.value);
 
 async function loadGlobalRemoteSearchResults(query: string, signal: AbortSignal, onProgress: (results: SidebarRemoteSearchResult[]) => void) {
-  const connectionId = store.activeConnectionId;
-  if (!connectionId || !store.connectedIds.has(connectionId) || signal.aborted) return [];
-  const rootPath = findNodePathByIdentity(store.treeNodes, connectionId, { connectionId, database: "", nodeType: "connection" });
-  const root = rootPath?.[rootPath.length - 1];
-  if (!root) return [];
-  return collectSidebarRemoteSearchResults({
-    root,
-    connectionId,
-    databaseScope: resolveSidebarSearchDatabaseScope(root, { enabled: settingsStore.editorSettings.sidebarSearchOpenedDatabasesOnly, isChildrenLoaded: store.isTreeNodeChildrenLoaded, openDatabaseKeys: queryStore.openDatabaseKeys }),
-    signal,
-    isSimpleParent: (node) => !sidebarIndexedObjectGroupTypes.has(node.type) && isGlobalTableIndexParent(node),
-    discover: discoverGlobalSearchChildren,
-    search: (node, publish) => store.searchSidebarObjects(node, query, signal, publish),
-    onProgress,
-    onError: (error) => toast(error instanceof Error ? error.message : String(error), 5000),
-  });
+  const results: SidebarRemoteSearchResult[][] = [];
+  await runSidebarSearchTasks(
+    globalSearchConnectionRoots().map(({ connectionId, root }, index) => async () => {
+      if (signal.aborted || !store.connectedIds.has(connectionId)) return;
+      results[index] = await collectSidebarRemoteSearchResults({
+        root,
+        connectionId,
+        databaseScope: resolveSidebarSearchDatabaseScope(root, { enabled: settingsStore.editorSettings.sidebarSearchOpenedDatabasesOnly, isChildrenLoaded: store.isTreeNodeChildrenLoaded, openDatabaseKeys: queryStore.openDatabaseKeys }),
+        signal,
+        isSimpleParent: (node) => !sidebarIndexedObjectGroupTypes.has(node.type) && isGlobalTableIndexParent(node),
+        discover: discoverGlobalSearchChildren,
+        search: (node, publish) => store.searchSidebarObjects(node, query, signal, publish),
+        onProgress,
+        onError: (error) => toast(error instanceof Error ? error.message : String(error), 5000),
+      });
+    }),
+  );
+  return results.flat();
 }
 
 function isGlobalTableIndexParent(node: TreeNode): boolean {
@@ -613,44 +698,64 @@ async function loadGlobalTableSearchIndexes(shouldCancel: () => boolean, onProgr
       shouldCancel,
     );
   }
-  const connectionId = store.activeConnectionId;
-  if (!connectionId || !store.connectedIds.has(connectionId)) return [];
-  const rootPath = findNodePathByIdentity(store.treeNodes, connectionId, { connectionId, database: "", nodeType: "connection" });
-  const root = rootPath?.[rootPath.length - 1];
-  if (!root) return [];
-  const databaseScope = resolveSidebarSearchDatabaseScope(root, {
-    enabled: settingsStore.editorSettings.sidebarSearchOpenedDatabasesOnly,
-    isChildrenLoaded: store.isTreeNodeChildrenLoaded,
-    openDatabaseKeys: queryStore.openDatabaseKeys,
-  });
-  return collectSidebarGlobalSearchIndexes(
-    {
-      loadCachedScopes: async () =>
-        (await store.loadSidebarTableSearchIndexScopes((scope) => scope.connectionId === connectionId && (settingsStore.editorSettings.sidebarObjectDisplay === "simple" ? !scope.nodeType.startsWith("group-") : sidebarIndexedObjectGroupTypes.has(scope.nodeType as TreeNodeType)))).map(
-          ({ scope, entries, stale }) => ({ ...scope, entries, stale }),
-        ),
-      isIndexParent: isGlobalTableIndexParent,
-      discover: discoverGlobalSearchChildren,
-      loadIndex: (node, options) => {
-        if (shouldCancel() || !store.connectedIds.has(connectionId)) return Promise.resolve(null);
-        return store.ensureSidebarTableSearchIndex(node.id, deferredSearchQuery.value, { connectionId, database: node.database ?? "", schema: node.schema, catalog: node.catalog, nodeType: node.type }, { connectedOnly: true, refresh: options?.refresh });
-      },
-      onError: (_node, error) => toast(error instanceof Error ? error.message : String(error), 5000),
-    },
-    [root],
-    connectionId,
-    databaseScope,
-    shouldCancel,
-    onProgress,
+  const results: SidebarRegexIndexScope[][] = [];
+  await runSidebarSearchTasks(
+    globalSearchConnectionRoots().map(({ connectionId, root }, index) => async () => {
+      if (shouldCancel() || !store.connectedIds.has(connectionId)) return;
+      const databaseScope = resolveSidebarSearchDatabaseScope(root, {
+        enabled: settingsStore.editorSettings.sidebarSearchOpenedDatabasesOnly,
+        isChildrenLoaded: store.isTreeNodeChildrenLoaded,
+        openDatabaseKeys: queryStore.openDatabaseKeys,
+      });
+      try {
+        results[index] = await collectSidebarGlobalSearchIndexes(
+          {
+            loadCachedScopes: async () =>
+              (await store.loadSidebarTableSearchIndexScopes((scope) => scope.connectionId === connectionId && (settingsStore.editorSettings.sidebarObjectDisplay === "simple" ? !scope.nodeType.startsWith("group-") : sidebarIndexedObjectGroupTypes.has(scope.nodeType as TreeNodeType)))).map(
+                ({ scope, entries, stale }) => ({ ...scope, entries, stale }),
+              ),
+            isIndexParent: isGlobalTableIndexParent,
+            discover: discoverGlobalSearchChildren,
+            loadIndex: (node, options) => {
+              if (shouldCancel() || !store.connectedIds.has(connectionId)) return Promise.resolve(null);
+              return store.ensureSidebarTableSearchIndex(node.id, globalIndexSearchQuery.value, { connectionId, database: node.database ?? "", schema: node.schema, catalog: node.catalog, nodeType: node.type }, { connectedOnly: true, refresh: options?.refresh });
+            },
+            onError: (_node, error) => toast(error instanceof Error ? error.message : String(error), 5000),
+          },
+          [root],
+          connectionId,
+          databaseScope,
+          shouldCancel,
+          (scopes) => {
+            results[index] = scopes;
+            onProgress(results.flat());
+          },
+        );
+      } catch (error) {
+        if (!shouldCancel()) toast(error instanceof Error ? error.message : String(error), 5000);
+      }
+    }),
   );
+  return results.flat();
 }
 
 function filterGloballyIndexedTables(nodes: TreeNode[]): TreeNode[] {
   if (!deferredSearchQuery.value) return nodes;
-  const matcher = createSidebarLabelMatcher(deferredSearchQuery.value, { regexMode: regexMode.value });
-  const matchingScopes = globalTableSearchScopes.value.map((scope) => ({ ...scope, entries: scope.entries.filter((entry) => !!matcher(entry.name) || !!matcher(entry.comment || "")) })).filter((scope) => scope.entries.length > 0);
-  return mergeSidebarRegexIndexScopes(nodes, matchingScopes);
+  const qualified = qualifiedGlobalSearch.value;
+  const matcher = createSidebarLabelMatcher(qualified?.name ?? deferredSearchQuery.value, { regexMode: regexMode.value, matchMode: searchMatchMode.value });
+  const includeComment = regexMode.value || searchMatchMode.value !== "exact";
+  const matchingScopes = globalTableSearchScopes.value
+    .map((scope) => ({
+      ...scope,
+      entries: scope.entries.filter((entry) => (!qualified || qualifiedTableQueryMatchesScope(qualified, { database: scope.database, schema: entry.schema ?? scope.schema, catalog: scope.catalog })) && (!!matcher(entry.name) || (includeComment && !!matcher(entry.comment || "")))),
+    }))
+    .filter((scope) => scope.entries.length > 0);
+  // A qualified query must surface only the matched schema, so do not merge the
+  // rest of the live tree back in the way an unqualified label search would.
+  return mergeSidebarRegexIndexScopes(nodes, matchingScopes, store.resolveSidebarSearchDetailTable, { scopesOnly: !!qualified });
 }
+
+watch([deferredSearchQuery, regexMode, searchMatchMode, () => store.sidebarTableSearchIndexInvalidation.revision, () => [...store.connectedIds].join("\0")], store.clearSidebarSearchDetailTables, { flush: "sync" });
 
 function scheduleLocalSidebarTableSearchRefresh(parentNodeId: string, focusRestore?: TableSearchFocusRestore) {
   if (isTreeSearchFiltering.value) {
@@ -717,13 +822,19 @@ const filteredNodes = computed(() => {
     nodes = filterSidebarTreeToConnectedConnections(nodes, store.connectedIds);
   }
 
+  if (!isTreeSearchFiltering.value) nodes = filterConnectionIndexes(nodes, indexSearchConnectionIds.value, connectionIndexSearchQueries.value);
   nodes = filterLocallySearchedTables(nodes, { enabled: settingsStore.editorSettings.sidebarTableSearchLocal, queries: store.sidebarTableSearchQueries, indexedResults: localTableSearchResults.value });
   nodes = filterGloballyIndexedTables(nodes);
   nodes = mergeSidebarRemoteSearchResults(nodes, remoteSearchResults.value);
+  if (settingsStore.editorSettings.sidebarObjectDisplay === "simple" && settingsStore.editorSettings.sidebarSimpleHideIndexes) nodes = hideSimpleSidebarIndexes(nodes);
 
-  const q = deferredSearchQuery.value;
+  // A qualified `schema.table` query is resolved entirely by the index scopes
+  // above; feeding the dotted text to the label filter would prune those results.
+  const q = qualifiedGlobalSearch.value ? "" : deferredSearchQuery.value;
   nodes = filterSidebarTree(nodes, q, searchCollapsedIds.value, searchableNodeTypes.value, {
     regexMode: regexMode.value,
+    matchMode: searchMatchMode.value,
+    searchExpandedIds: searchExpandedIds.value,
     resolveLabel: (node) => (node.type === "nacos-access-control" ? t("nacos.accessControlSidebarLabel") : node.label),
   });
   if (q && !regexMode.value) {
@@ -746,13 +857,14 @@ const projectedConnectionIds = computed<ReadonlySet<string> | null>(() => {
   return connectionIds;
 });
 
-const flatNodes = computed<FlatTreeNode[]>(() =>
-  insertSidebarTableSearchControls(flattenTree(filteredNodes.value), {
+const flatNodes = computed<FlatTreeNode[]>(() => {
+  const nodes = insertSidebarTableSearchControls(flattenTree(filteredNodes.value), {
     enabled: settingsStore.editorSettings.sidebarTableSearchEnabled && !isTreeSearchFiltering.value,
     sidebarObjectDisplay: settingsStore.editorSettings.sidebarObjectDisplay,
     activeQueries: store.sidebarTableSearchQueries,
-  }),
-);
+  });
+  return isTreeSearchFiltering.value ? nodes : insertConnectionIndexSearchControls(nodes, indexSearchConnectionIds.value);
+});
 
 // Debug instrumentation for the "expanded tree leaves the scroll shell stuck
 // (e.g. Dameng connection expanded and the viewport froze near half height)"
@@ -821,8 +933,10 @@ function sidebarCommentLabel(node: TreeNode): string {
 
 // Shared by the aligned comment column and the full horizontal content width.
 // Pin controls are reserved separately so unpinned siblings stay aligned too.
-const sidebarTreeLeadingWidthItems = computed(() =>
-  flatNodes.value.map(({ id, depth, node }) => {
+const sidebarTreeLeadingWidthItems = computed(() => {
+  // Only comment alignment and horizontal scrolling consume these measurements.
+  if (settingsStore.editorSettings.sidebarObjectInfoMode !== "comment-aligned" && !settingsStore.editorSettings.sidebarAllowHorizontalScroll) return [];
+  return flatNodes.value.map(({ id, depth, node }) => {
     const config = node.connectionId ? store.getConfig(node.connectionId) : undefined;
     const badges: string[] = [];
     if (node.type === "column" && node.meta) badges.push(t((node.meta as ColumnInfo).is_nullable ? "structureEditor.nullable" : "structureEditor.notNull"));
@@ -832,8 +946,8 @@ const sidebarTreeLeadingWidthItems = computed(() =>
     const secondary = sidebarTreeSecondaryValue(node, t, config ? effectiveDatabaseTypeForConnection(config) : undefined);
     const leadingExtraWidth = (secondary && node.type === "elasticsearch-index" ? 16 : 0) + (node.type === "oracle-db-links" ? 26 : 0);
     return { id, depth, node, label: sidebarCommentLabel(node), badges, secondary, leadingExtraWidth };
-  }),
-);
+  });
+});
 
 function measureSidebarTreeLeadingWidth(item: (typeof sidebarTreeLeadingWidthItems.value)[number], context: CanvasRenderingContext2D): number {
   return context.measureText(item.label).width + item.leadingExtraWidth + item.badges.reduce((width, badge) => width + context.measureText(badge).width + 24, 0) + (item.secondary ? context.measureText(item.secondary).width + 8 : 0);
@@ -879,8 +993,9 @@ function scheduleSidebarCommentLabelMeasure() {
 // Describe every expanded row, including those outside the virtual viewport.
 // Keep text measurement independent of mounted TreeItems so scrolling cannot
 // change the horizontal range or truncate a newly materialized row.
-const sidebarTreeNaturalWidthItems = computed(() =>
-  sidebarTreeLeadingWidthItems.value.map((item) => {
+const sidebarTreeNaturalWidthItems = computed(() => {
+  if (!settingsStore.editorSettings.sidebarAllowHorizontalScroll) return [];
+  return sidebarTreeLeadingWidthItems.value.map((item) => {
     const { depth, node } = item;
     const mode = settingsStore.editorSettings.sidebarObjectInfoMode;
     const comment = mode.startsWith("comment-") ? (sidebarTreeNodeComment(node, settingsStore.editorSettings.sidebarShowConnectionNotes) ?? undefined) : undefined;
@@ -898,6 +1013,9 @@ const sidebarTreeNaturalWidthItems = computed(() =>
     return {
       ...item,
       depth,
+      // 连接行的自然宽度需要涵盖 endpoint 文本与两字宽间隔（仅用于测量，渲染由 TreeItem 完成）。
+      // 全角空格近似 2em 间隔；endpoint 实际渲染字号更小（0.85em），测量按行字号略高估，安全。
+      label: node.type === "connection" && settingsStore.editorSettings.sidebarShowConnectionEndpoints ? [item.label, "　　", connectionEndpointUserLabel(config)].join("").trimEnd() : item.label,
       usesNaturalWidth: usesFullWidthTreeLabel(node.type, settingsStore.editorSettings.sidebarAllowHorizontalScroll),
       comment,
       rightAlignedComment: mode === "comment-right",
@@ -907,8 +1025,8 @@ const sidebarTreeNaturalWidthItems = computed(() =>
       badges,
       alignedWidth: comment && mode === "comment-aligned" && node.type !== "connection" ? (sidebarCommentLabelWidths.value.get(node.id) ?? 0) + (canTreeNodePin(node.type) ? sidebarPinnedActionSlotWidthPx : 0) : 0,
     };
-  }),
-);
+  });
+});
 
 function measureSidebarTreeContentWidth() {
   sidebarTreeContentMeasureFrame = 0;
@@ -1075,8 +1193,10 @@ watch(
 // boundary, while native sticky rows would cover that non-sticky connection.
 const stickyScrollTop = ref(0);
 const plainStickyContainerIndex = ref(-1);
+const plainStickyConnectionIndex = ref(-1);
 const sidebarScrollMetrics = ref({ scrollTop: 0, scrollLeft: 0, clientHeight: 0, clientWidth: 0, scrollHeight: 0, scrollWidth: 0 });
 const stickyRowRef = ref<HTMLElement | null>(null);
+const stickyConnectionRowRef = ref<HTMLElement | null>(null);
 const isScrollingSidebar = ref(false);
 const isDraggingSidebarScrollbar = ref(false);
 const isDraggingSidebarHorizontalScrollbar = ref(false);
@@ -1097,10 +1217,12 @@ function updateSidebarScrollMetrics() {
   stickyScrollTop.value = scroller.scrollTop;
   if (useVirtualTree.value || isTreeSearchFiltering.value) {
     plainStickyContainerIndex.value = -1;
+    plainStickyConnectionIndex.value = -1;
   } else {
     const scrollerTop = scroller.getBoundingClientRect().top + scroller.clientTop;
     const rows = Array.from(scroller.querySelectorAll<HTMLElement>("[data-node-id]")).map((row) => ({ nodeId: row.dataset.nodeId ?? "", top: row.getBoundingClientRect().top }));
     plainStickyContainerIndex.value = resolvePlainStickyContainerIndex(flatNodes.value, flatTreeIndex.value, rows, scrollerTop);
+    plainStickyConnectionIndex.value = resolvePlainStickyContainerIndex(flatNodes.value, flatTreeIndex.value, rows, scrollerTop, "connection");
   }
   sidebarScrollMetrics.value = {
     scrollTop: scroller.scrollTop,
@@ -1203,6 +1325,33 @@ const stickyContainerIndex = computed(() => {
 
 const stickyNode = computed<FlatTreeNode | null>(() => flatNodes.value[stickyContainerIndex.value] ?? null);
 
+const stickyConnectionIndex = computed(() => {
+  if (isTreeSearchFiltering.value || stickyScrollTop.value <= 0) return -1;
+  if (!useVirtualTree.value) return plainStickyConnectionIndex.value;
+  const topIndex = Math.min(Math.floor(stickyScrollTop.value / sidebarTreeRowHeight.value), flatNodes.value.length - 1);
+  const index = flatTreeIndex.value.connectionIndexByIndex[topIndex] ?? -1;
+  return index >= 0 && stickyScrollTop.value > index * sidebarTreeRowHeight.value ? index : -1;
+});
+const stickyConnection = computed(() => {
+  const connection = flatNodes.value[stickyConnectionIndex.value];
+  return connection?.node.isExpanded ? connection : null;
+});
+const stickyConnectionStyle = computed<CSSProperties>(() => {
+  if (!stickyConnection.value) return {};
+  const height = sidebarTreeRowHeight.value;
+  const nextBoundary = flatTreeIndex.value.nextBoundaryIndexByIndex[stickyConnectionIndex.value] ?? -1;
+  if (nextBoundary < 0) return { height: `${height}px` };
+  let distance = nextBoundary * height - stickyScrollTop.value;
+  if (!useVirtualTree.value) {
+    const scroller = plainTreeScrollerRef.value;
+    const nextId = flatNodes.value[nextBoundary]?.id;
+    const row = nextId ? scroller?.querySelector<HTMLElement>(`[data-node-id="${CSS.escape(nextId)}"]`) : undefined;
+    if (scroller && row) distance = row.getBoundingClientRect().top - scroller.getBoundingClientRect().top - scroller.clientTop;
+  }
+  return { height: `${height}px`, transform: `translateY(${Math.min(0, distance - height)}px)` };
+});
+const stickyConnectionHeight = computed(() => (stickyConnection.value ? sidebarTreeRowHeight.value : 0));
+
 // Search controls belong to their parent subtree, including schema and table
 // group scopes. Build the lookup once per tree change, not on every scroll.
 type StickyTableSearchScope = { item: FlatTreeNode; endIndex: number };
@@ -1243,21 +1392,20 @@ const stickyTableSearchScope = computed(() => {
 const stickyTableSearchNode = computed(() => stickyTableSearchScope.value?.item ?? null);
 
 function syncStickyRowHorizontalPosition(scroller = currentTreeScroller()) {
-  const row = stickyRowRef.value;
-  if (!row) return;
-
-  if (!settingsStore.editorSettings.sidebarAllowHorizontalScroll || !scroller) {
-    row.style.removeProperty("width");
-    row.style.removeProperty("transform");
-    return;
+  for (const row of [stickyRowRef.value, stickyConnectionRowRef.value]) {
+    if (!row) continue;
+    if (!settingsStore.editorSettings.sidebarAllowHorizontalScroll || !scroller) {
+      row.style.removeProperty("width");
+      row.style.removeProperty("transform");
+    } else {
+      row.style.width = `${Math.max(scroller.clientWidth, sidebarTreeContentWidth.value)}px`;
+      row.style.transform = `translate3d(${-scroller.scrollLeft}px, 0, 0)`;
+    }
   }
-
-  row.style.width = `${Math.max(scroller.clientWidth, sidebarTreeContentWidth.value)}px`;
-  row.style.transform = `translate3d(${-scroller.scrollLeft}px, 0, 0)`;
 }
 
 watch(
-  [stickyNode, useVirtualTree, treeScrollerRef, plainTreeScrollerRef],
+  [stickyNode, stickyConnection, useVirtualTree, treeScrollerRef, plainTreeScrollerRef],
   () => {
     void nextTick(() => syncStickyRowHorizontalPosition());
   },
@@ -1281,11 +1429,17 @@ const stickyHeaderStyle = computed<CSSProperties>(() => {
     const nextRow = nextNodeId ? Array.from(scroller?.querySelectorAll<HTMLElement>("[data-node-id]") ?? []).find((row) => row.dataset.nodeId === nextNodeId) : undefined;
     if (scroller && nextRow) distanceToNext = nextRow.getBoundingClientRect().top - scroller.getBoundingClientRect().top;
   }
-  if (distanceToNext >= stickyHeaderHeight.value) return {};
+  const clearance = distanceToNext - stickyHeaderHeight.value;
   return {
-    transform: `translateY(${Math.min(0, distanceToNext - stickyHeaderHeight.value)}px)`,
+    "--sticky-header-clearance": `${clearance}px`,
+    ...(clearance < 0 ? { transform: `translateY(${clearance}px)` } : {}),
   };
 });
+
+const stickyContainerStyle = computed<CSSProperties>(() => ({
+  ...stickyHeaderStyle.value,
+  transform: `translateY(min(0px, calc(var(--sticky-header-clearance, 100vh) - ${stickyConnectionHeight.value}px)))`,
+}));
 
 // Keep the badge outside the translated header so production-to-production
 // handovers do not cover or remount it. Both tree renderers share this context.
@@ -1518,6 +1672,14 @@ function onSidebarHorizontalScrollbarThumbPointerDown(event: PointerEvent) {
 const pasteHandlerRegistry = createSidebarPasteHandlerRegistry();
 
 provide(sidebarTreeContextKey, {
+  getIndexSearchQuery: (parentNodeId) => connectionIndexSearchQueries.value[parentNodeId] ?? "",
+  setIndexSearchQuery: (parentNodeId, query) => {
+    const focusRestore = captureTableSearchFocus(parentNodeId);
+    latestTableSearchInteractionParentId = parentNodeId;
+    latestTableSearchInteractionId = focusRestore.interactionId;
+    connectionIndexSearchQueries.value = { ...connectionIndexSearchQueries.value, [parentNodeId]: query };
+    restoreTableSearchInput(focusRestore);
+  },
   getVisibleNodes: () => selectableVisibleNodes.value,
   getVisibleNodeIndex: (id: string) => selectableVisibleNodeIndexById.value.get(id) ?? -1,
   getVisibleFlatNodes: () => flatNodes.value.filter((item) => !isSidebarTableSearchControlNode(item.node)),
@@ -1529,6 +1691,10 @@ provide(sidebarTreeContextKey, {
   // collapse while a projection is about to start, and the deferred query
   // keeps the currently rendered projection alive while clearing settles.
   isSearchProjectionActive: () => isTreeSearchFiltering.value || !!deferredSearchQuery.value,
+  retainSearchDetailTable: (node) => {
+    if (deferredSearchQuery.value) store.retainSidebarSearchDetailTable(node);
+  },
+  findSearchDetailNode: store.findSidebarSearchDetailNode,
   removeVerifiedTriggerNode: removeVerifiedRemoteTriggerNode,
   getTreeLoadSearchOptions: () => {
     if (!deferredSearchQuery.value) return undefined;
@@ -1615,9 +1781,9 @@ async function flashSidebarNode(nodeId: string) {
 }
 
 function topOcclusionHeightForSidebarNode(nodeId: string): number {
+  if (stickyConnection.value?.id === nodeId) return 0;
   const sticky = stickyNode.value;
-  if (!sticky || sticky.id === nodeId) return 0;
-  return stickyHeaderHeight.value;
+  return stickyConnectionHeight.value + (sticky && sticky.id !== nodeId ? stickyHeaderHeight.value : 0);
 }
 
 /** Select and reveal a freshly created table group. */
@@ -1726,6 +1892,28 @@ async function startRenamingConnectionNode(connectionId: string) {
   store.selectedTreeNodeId = connectionId;
 }
 
+function expandSidebarNodePath(nodePath: TreeNode[]): void {
+  expandSidebarLocatePath(nodePath, store.canUseLoadedTreeNodeToggle);
+
+  // 表分组行同样是投影出的合成节点（不登记已加载子节点，上面的守卫会跳过），
+  // 折叠状态存在布局里，必须经布局 op 展开，否则下次投影又把它折叠回去。
+  for (const node of nodePath) {
+    if (node.type !== "table-vgroup" || !node.vgroupId) continue;
+    const group = store.tableVGroupLayoutFor(node)?.groups.find((current) => current.id === node.vgroupId);
+    if (group?.collapsed) store.toggleTableVGroupCollapsed(node, node.vgroupId);
+  }
+
+  // Connection groups never register loaded tree children, so the guard above
+  // skips them and a collapsed group keeps the target out of the visible flat
+  // tree. Reopen them through the layout op so the expansion is persisted and
+  // survives the next layout rebuild; flipping isExpanded directly would be
+  // reverted by that rebuild (issue #7387).
+  const collapsedGroupIds = nodePath.filter((node) => node.type === "connection-group" && !node.isExpanded).map((node) => node.id);
+  if (collapsedGroupIds.length > 0) {
+    store.expandConnectionGroups(collapsedGroupIds);
+  }
+}
+
 async function locateActiveTabInSidebar() {
   await locateTabInSidebar(activeTab.value, "smart");
 }
@@ -1820,25 +2008,7 @@ async function locateTabInSidebarTarget(tab: QueryTab | undefined | null, align:
     return;
   }
 
-  expandSidebarLocatePath(nodePath, store.canUseLoadedTreeNodeToggle);
-
-  // 表分组行同样是投影出的合成节点（不登记已加载子节点，上面的守卫会跳过），
-  // 折叠状态存在布局里，必须经布局 op 展开，否则下次投影又把它折叠回去。
-  for (const node of nodePath) {
-    if (node.type !== "table-vgroup" || !node.vgroupId) continue;
-    const group = store.tableVGroupLayoutFor(node)?.groups.find((current) => current.id === node.vgroupId);
-    if (group?.collapsed) store.toggleTableVGroupCollapsed(node, node.vgroupId);
-  }
-
-  // Connection groups never register loaded tree children, so the guard above
-  // skips them and a collapsed group keeps the target out of the visible flat
-  // tree. Reopen them through the layout op so the expansion is persisted and
-  // survives the next layout rebuild; flipping isExpanded directly would be
-  // reverted by that rebuild (issue #7387).
-  const collapsedGroupIds = nodePath.filter((node) => node.type === "connection-group" && !node.isExpanded).map((node) => node.id);
-  if (collapsedGroupIds.length > 0) {
-    store.expandConnectionGroups(collapsedGroupIds);
-  }
+  expandSidebarNodePath(nodePath);
 
   await nextTick();
 
@@ -1848,6 +2018,7 @@ async function locateTabInSidebarTarget(tab: QueryTab | undefined | null, align:
   store.selectedTreeNodeId = match.id;
   store.selectedTreeNodeIds = [match.id];
   store.treeSelectionAnchorId = match.id;
+  store.connectionMultiSelectActive = false;
   await nextTick();
 
   await scrollToSidebarNode(match.id, { align });
@@ -2100,21 +2271,28 @@ function findSchemaNode(nodes: TreeNode[], connId: string, database: string, sch
 }
 
 function onSearchToggle(node: TreeNode) {
-  if (!isTreeSearchFiltering.value || !node.children) return;
+  if (!isTreeSearchFiltering.value) return;
   const next = new Set(searchCollapsedIds.value);
+  const expanded = new Set(searchExpandedIds.value);
   if (node.isExpanded) {
     next.add(node.id);
+    if (node.type === "group-partitions") expanded.delete(node.id);
     const collectDescendants = (children: readonly TreeNode[]) => {
       for (const child of children) {
         next.add(child.id);
         if (child.children?.length) collectDescendants(child.children);
       }
     };
-    collectDescendants(node.children);
+    // A table reached through search has no children until its groups load;
+    // expanding still has to clear its id, otherwise the collapse-all seed keeps
+    // the freshly loaded children hidden and the row looks unexpandable (#13856).
+    if (node.children?.length) collectDescendants(node.children);
   } else {
     next.delete(node.id);
+    if (node.type === "group-partitions") expanded.add(node.id);
   }
   searchCollapsedIds.value = next;
+  searchExpandedIds.value = expanded;
 }
 
 function onNodeToggled(node: TreeNode, expanded: boolean) {
@@ -2129,6 +2307,12 @@ function onNodeToggled(node: TreeNode, expanded: boolean) {
     nodeType: node.type,
     expanded,
   });
+}
+
+function handleTreeNodeToggled(node: TreeNode, expanded: boolean) {
+  const restorePinnedFocus = !expanded && node.type === "connection" && stickyConnectionRowRef.value?.contains(document.activeElement);
+  onNodeToggled(node, expanded);
+  if (restorePinnedFocus) void focusSidebarTreeNode(node.id);
 }
 
 let contextMenuRequest = 0;
@@ -2299,6 +2483,7 @@ function openSidebarData(node: TreeNode, requireSelection: boolean, openMode: "d
   runSidebarDataOpenImmediately(
     {
       connectionKey: target.connectionId || target.id,
+      targetKey: target.id,
       // Explicit new-tab opens are intentional independent work; ordinary
       // navigation keeps latest-request-wins behavior.
       supersede: openMode !== "new-tab",
@@ -2484,19 +2669,39 @@ function currentTreeScroller(): HTMLElement | null {
   return ((useVirtualTree.value ? treeScrollerRef.value?.$el : plainTreeScrollerRef.value) as HTMLElement | undefined) ?? null;
 }
 
-async function selectActiveTabSidebarNode(options: { scroll: boolean }) {
-  if (!settingsStore.editorSettings.autoSelectActiveSidebarNode) return;
-  const match = findSidebarNodeForActiveTab(activeTab.value, flatNodes.value);
-  if (!match) return;
+async function selectActiveTabSidebarNode(options: { scroll: boolean }): Promise<boolean> {
+  if (!settingsStore.editorSettings.autoSelectActiveSidebarNode) return false;
+  const tab = activeTab.value;
+  if (!tab) return false;
 
-  store.selectedTreeNodeId = match.id;
-  if (!options.scroll) return;
+  let match = findSidebarNodeForActiveTab(tab, flatNodes.value);
+  if (!match) {
+    const target = activeTabSidebarTarget(tab);
+    const nodePath = target ? findNodePathForTarget(target, store.treeNodes) : null;
+    if (nodePath && nodePath.length > 0) {
+      expandSidebarNodePath(nodePath);
+      await nextTick();
+      if (activeTab.value?.id !== tab.id) return false;
+      match = findSidebarNodeForActiveTab(tab, flatNodes.value);
+    }
+  }
+  if (!match) return false;
+  if (activeTab.value?.id !== tab.id) return false;
+
+  if (store.connectionMultiSelectActive || store.selectedTreeNodeId !== match.id || store.treeSelectionAnchorId !== match.id || store.selectedTreeNodeIds.length !== 1 || store.selectedTreeNodeIds[0] !== match.id) {
+    store.selectedTreeNodeId = match.id;
+    store.selectedTreeNodeIds = [match.id];
+    store.treeSelectionAnchorId = match.id;
+    store.connectionMultiSelectActive = false;
+  }
+  if (!options.scroll) return true;
 
   await nextTick();
 
+  if (activeTab.value?.id !== tab.id || !settingsStore.editorSettings.autoSelectActiveSidebarNode) return false;
   const index = flatTreeIndex.value.flatNodeIndexById.get(match.id) ?? -1;
   const scroller = currentTreeScroller();
-  if (!scroller || index < 0) return;
+  if (!scroller || index < 0) return true;
 
   const nextScrollTop = scrollTopForSidebarNode({
     index,
@@ -2509,24 +2714,57 @@ async function selectActiveTabSidebarNode(options: { scroll: boolean }) {
   if (nextScrollTop !== scroller.scrollTop) {
     scroller.scrollTop = nextScrollTop;
   }
+  return true;
 }
+
+// The reveal must settle: re-running it on every flatNodes change (expansion, collapse, async
+// loads after it landed) re-expanded whatever the user had just collapsed (#13839, #13849).
+// Pending stays true across flatNodes-only fires until the target is found, so async tree
+// loads still complete the reveal started by a tab switch or a setting toggle.
+const activeTabRevealTracker = new ActiveTabSidebarRevealTracker();
 
 watch(
   [() => activeTab.value?.id ?? null, flatNodes, () => settingsStore.editorSettings.autoSelectActiveSidebarNode],
   ([activeTabId, _nodes, autoSelectEnabled], [previousActiveTabId, _previousNodes, previousAutoSelectEnabled]) => {
-    void selectActiveTabSidebarNode({
-      scroll: shouldScrollActiveSidebarSelection({
-        activeTabId,
-        previousActiveTabId,
-        autoSelectEnabled,
-        previousAutoSelectEnabled,
-      }),
+    const trigger = activeTabRevealTracker.onWatchTrigger({
+      activeTabId,
+      previousActiveTabId,
+      autoSelectEnabled,
+      previousAutoSelectEnabled,
     });
+    if (!trigger.run) return;
+    void selectActiveTabSidebarNode({ scroll: trigger.scroll }).then((found) => activeTabRevealTracker.onSettled(found, activeTabId));
   },
   { flush: "post" },
 );
 
+let latestLocalTableSearchFocusRequestId = 0;
+
+function focusGlobalSearch(): boolean {
+  const input = searchInputRef.value;
+  if (!input) return false;
+  input.focus();
+  input.select();
+  return true;
+}
+
+function findLocalTableSearchInput(parent: TreeNode): HTMLInputElement | null {
+  const root = rootRef.value;
+  if (!root) return null;
+  const directInput = root.querySelector<HTMLInputElement>(`[data-sidebar-table-search-parent-id="${CSS.escape(parent.id)}"]`);
+  if (directInput) return directInput;
+  if (parent.children) {
+    const tableGroup = parent.children.find((c) => c.type === "group-tables");
+    if (tableGroup) {
+      const groupInput = root.querySelector<HTMLInputElement>(`[data-sidebar-table-search-parent-id="${CSS.escape(tableGroup.id)}"]`);
+      if (groupInput) return groupInput;
+    }
+  }
+  return null;
+}
+
 function focusSearch(target: Element | null = null): boolean {
+  const focusRequestId = ++latestLocalTableSearchFocusRequestId;
   const tableSearchControl = target?.closest<HTMLElement>("[data-sidebar-table-search-control]");
   if (tableSearchControl) {
     const input = tableSearchControl.querySelector<HTMLInputElement>("[data-sidebar-table-search-parent-id]");
@@ -2536,10 +2774,93 @@ function focusSearch(target: Element | null = null): boolean {
       return true;
     }
   }
-  const input = searchInputRef.value;
-  if (!input) return false;
-  input.focus();
-  input.select();
+
+  // Preserve user's setting: do not overwrite editorSettings.sidebarTableSearchEnabled on Ctrl+F
+  if (!settingsStore.editorSettings.sidebarTableSearchEnabled) {
+    return focusGlobalSearch();
+  }
+
+  const targetNodeId = target?.closest<HTMLElement>("[data-node-id]")?.dataset.nodeId;
+  const activeNodeId = targetNodeId || store.selectedTreeNodeId || findSidebarNodeForActiveTab(activeTab.value, flatNodes.value)?.id || null;
+  const searchParent = resolveLocalTableSearchParent(store.treeNodes, activeNodeId, settingsStore.editorSettings.sidebarObjectDisplay);
+
+  if (!searchParent) {
+    return focusGlobalSearch();
+  }
+
+  const existingInput = findLocalTableSearchInput(searchParent);
+  if (existingInput) {
+    existingInput.focus();
+    existingInput.select();
+    return true;
+  }
+
+  if (!searchParent.isExpanded) {
+    sidebarTreeRuntimeHostRef.value?.toggleNode(searchParent);
+  }
+
+  const initialTabId = activeTab.value?.id ?? null;
+  const initialTargetNodeId = activeNodeId;
+
+  void (async () => {
+    const timeoutAt = Date.now() + 2500;
+    let attempts = 0;
+    const maxAttempts = 150;
+
+    const isStale = () => {
+      if (!settingsStore.editorSettings.sidebarTableSearchEnabled) return true;
+      if (focusRequestId !== latestLocalTableSearchFocusRequestId) return true;
+      if ((activeTab.value?.id ?? null) !== initialTabId) return true;
+      const currentActiveNodeId = store.selectedTreeNodeId || findSidebarNodeForActiveTab(activeTab.value, flatNodes.value)?.id || null;
+      if (initialTargetNodeId && currentActiveNodeId && currentActiveNodeId !== initialTargetNodeId) return true;
+      return false;
+    };
+
+    while (attempts++ < maxAttempts && Date.now() < timeoutAt) {
+      await nextTick();
+      if (isStale()) return;
+
+      const currentParent = resolveLocalTableSearchParent(store.treeNodes, initialTargetNodeId, settingsStore.editorSettings.sidebarObjectDisplay) ?? searchParent;
+      const effectiveParent = currentParent.type === "group-tables" ? currentParent : settingsStore.editorSettings.sidebarObjectDisplay === "grouped" ? (currentParent.children?.find((c) => c.type === "group-tables") ?? currentParent) : currentParent;
+
+      if (settingsStore.editorSettings.sidebarObjectDisplay === "grouped" && effectiveParent.type === "group-tables" && !effectiveParent.isExpanded) {
+        sidebarTreeRuntimeHostRef.value?.toggleNode(effectiveParent);
+      }
+
+      const searchControlNodeId = tableSearchControlId(effectiveParent.id);
+
+      if (flatTreeIndex.value.flatNodeIndexById.has(searchControlNodeId)) {
+        await scrollToSidebarNode(searchControlNodeId);
+        await waitForSidebarRenderFrame();
+        if (isStale()) return;
+
+        const input = rootRef.value?.querySelector<HTMLInputElement>(`[data-sidebar-table-search-parent-id="${CSS.escape(effectiveParent.id)}"]`);
+        if (input) {
+          input.focus();
+          input.select();
+          return;
+        }
+      }
+
+      // Check if loading has finished and the scope has no searchable tables
+      const isLoading = currentParent.isLoading || (currentParent.children === undefined && currentParent.isExpanded);
+      if (!isLoading && currentParent.children !== undefined) {
+        const hasSearchableTables = settingsStore.editorSettings.sidebarObjectDisplay === "grouped" ? effectiveParent.type === "group-tables" && (effectiveParent.children === undefined || parentHasSearchableTableList(effectiveParent)) : parentHasSearchableTableList(currentParent);
+
+        if (!hasSearchableTables) {
+          break;
+        }
+      }
+
+      await waitForSidebarRenderFrame();
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+
+    if (!isStale()) {
+      focusGlobalSearch();
+    }
+  })();
+
   return true;
 }
 
@@ -2613,8 +2934,33 @@ function onWindowKeydown(event: KeyboardEvent) {
       }
       return;
     }
+    if (!event.repeat && !event.isComposing && !event.getModifierState("AltGraph") && sidebarShortcutTargetAllowsAppShortcut(event.target) && isCreateSidebarTableShortcut(event, settingsStore.editorSettings.shortcuts)) {
+      const selectedNodeId = store.selectedTreeNodeId;
+      const node = selectedNodeId ? flatTreeIndex.value.nodeById.get(selectedNodeId) : undefined;
+      if (node && store.selectedTreeNodeIds.length === 1 && sidebarTreeRuntimeHostRef.value?.createTableForSelection?.(node)) {
+        event.preventDefault();
+        event.stopPropagation();
+      }
+      return;
+    }
+    if (!event.repeat && sidebarShortcutTargetAllowsAppShortcut(event.target) && isCreateSidebarDatabaseShortcut(event, settingsStore.editorSettings.shortcuts)) {
+      const selectedNodeId = store.selectedTreeNodeId;
+      const node = selectedNodeId ? flatTreeIndex.value.nodeById.get(selectedNodeId) : undefined;
+      if (node && store.selectedTreeNodeIds.length === 1 && sidebarTreeRuntimeHostRef.value?.createDatabaseForSelection?.(node)) {
+        event.preventDefault();
+        event.stopPropagation();
+      }
+      return;
+    }
     if (sidebarShortcutTargetAllowsAppShortcut(event.target) && isRefreshDataShortcut(event, settingsStore.editorSettings.shortcuts)) {
       if (requestSelectedSidebarRefresh()) {
+        event.preventDefault();
+        event.stopPropagation();
+      }
+      return;
+    }
+    if (sidebarShortcutTargetAllowsAppShortcut(event.target) && isFocusSearchShortcut(event, settingsStore.editorSettings.shortcuts)) {
+      if (focusSearch(event.target instanceof Element ? event.target : null)) {
         event.preventDefault();
         event.stopPropagation();
       }
@@ -2759,6 +3105,7 @@ onMounted(() => {
 
 onUnmounted(() => {
   store.sidebarSearchQuery = "";
+  store.clearSidebarSearchDetailTables();
   sidebarLayoutMonitor.dispose();
   sidebarTreeRuntime.dispose();
   sidebarActionGeneration += 1;
@@ -2810,7 +3157,7 @@ defineExpose({
       :node="sidebarTreeRuntimeInitialNode"
       :depth="0"
       @search-toggle="onSearchToggle"
-      @node-toggled="onNodeToggled"
+      @node-toggled="handleTreeNodeToggled"
       @open-ddl="openSidebarDdl"
       @open-elasticsearch-index-metadata="openSidebarElasticsearchIndexMetadata"
       @open-object-source="openSidebarObjectSource"
@@ -2930,21 +3277,28 @@ defineExpose({
             />
           </template>
         </RecycleScroller>
-        <div v-if="stickyNode" class="sticky-database-header pointer-events-auto absolute inset-x-0 top-0 z-[5]" :style="stickyHeaderStyle">
-          <div ref="stickyRowRef">
-            <TreeItem
-              :node="stickyNode.node"
-              :depth="stickyNode.depth"
-              :reorder-disabled="true"
-              :reference-drag-disabled="true"
-              :comment-label-width="sidebarCommentLabelWidths.get(stickyNode.node.id)"
-              :is-sticky-context="stickyProductionContext"
-              @context-menu="(event, node) => openSidebarContextMenu(event, node, contextMenuSlot.onContextMenu)"
-            />
+        <div v-if="stickyConnection" class="sticky-connection-header absolute inset-x-0 top-0 z-[7]" :style="stickyConnectionStyle">
+          <div ref="stickyConnectionRowRef">
+            <TreeItem :key="stickyConnection.renderKey" :node="stickyConnection.node" :depth="stickyConnection.depth" :reorder-disabled="true" :reference-drag-disabled="true" @context-menu="(event, node) => openSidebarContextMenu(event, node, contextMenuSlot.onContextMenu)" />
           </div>
-          <TreeItem v-if="stickyTableSearchNode" :key="stickyTableSearchNode.renderKey" :node="stickyTableSearchNode.node" :depth="stickyTableSearchNode.depth" :reorder-disabled="true" :reference-drag-disabled="true" />
         </div>
-        <div v-if="stickyProductionContext" class="sidebar-sticky-production" :style="{ height: `${sidebarTreeRowHeight}px` }">
+        <div v-if="stickyNode" class="pointer-events-none absolute inset-x-0 z-[5] overflow-clip" :style="{ top: `${stickyConnectionHeight}px` }">
+          <div class="sticky-database-header pointer-events-auto" :style="stickyContainerStyle">
+            <div ref="stickyRowRef">
+              <TreeItem
+                :node="stickyNode.node"
+                :depth="stickyNode.depth"
+                :reorder-disabled="true"
+                :reference-drag-disabled="true"
+                :comment-label-width="sidebarCommentLabelWidths.get(stickyNode.node.id)"
+                :is-sticky-context="stickyProductionContext"
+                @context-menu="(event, node) => openSidebarContextMenu(event, node, contextMenuSlot.onContextMenu)"
+              />
+            </div>
+            <TreeItem v-if="stickyTableSearchNode" :key="stickyTableSearchNode.renderKey" :node="stickyTableSearchNode.node" :depth="stickyTableSearchNode.depth" :reorder-disabled="true" :reference-drag-disabled="true" />
+          </div>
+        </div>
+        <div v-if="stickyProductionContext" class="sidebar-sticky-production" :style="{ top: `${stickyConnectionHeight}px`, height: `${sidebarTreeRowHeight}px` }">
           <ProductionContextBadge compact />
         </div>
         <div
@@ -2985,21 +3339,28 @@ defineExpose({
             />
           </div>
         </div>
-        <div v-if="stickyNode" class="sticky-database-header pointer-events-auto absolute inset-x-0 top-0 z-[5]" :style="stickyHeaderStyle">
-          <div ref="stickyRowRef">
-            <TreeItem
-              :node="stickyNode.node"
-              :depth="stickyNode.depth"
-              :reorder-disabled="true"
-              :reference-drag-disabled="true"
-              :comment-label-width="sidebarCommentLabelWidths.get(stickyNode.node.id)"
-              :is-sticky-context="stickyProductionContext"
-              @context-menu="(event, node) => openSidebarContextMenu(event, node, contextMenuSlot.onContextMenu)"
-            />
+        <div v-if="stickyConnection" class="sticky-connection-header absolute inset-x-0 top-0 z-[7]" :style="stickyConnectionStyle">
+          <div ref="stickyConnectionRowRef">
+            <TreeItem :key="stickyConnection.renderKey" :node="stickyConnection.node" :depth="stickyConnection.depth" :reorder-disabled="true" :reference-drag-disabled="true" @context-menu="(event, node) => openSidebarContextMenu(event, node, contextMenuSlot.onContextMenu)" />
           </div>
-          <TreeItem v-if="stickyTableSearchNode" :key="stickyTableSearchNode.renderKey" :node="stickyTableSearchNode.node" :depth="stickyTableSearchNode.depth" :reorder-disabled="true" :reference-drag-disabled="true" />
         </div>
-        <div v-if="stickyProductionContext" class="sidebar-sticky-production" :style="{ height: `${sidebarTreeRowHeight}px` }">
+        <div v-if="stickyNode" class="pointer-events-none absolute inset-x-0 z-[5] overflow-clip" :style="{ top: `${stickyConnectionHeight}px` }">
+          <div class="sticky-database-header pointer-events-auto" :style="stickyContainerStyle">
+            <div ref="stickyRowRef">
+              <TreeItem
+                :node="stickyNode.node"
+                :depth="stickyNode.depth"
+                :reorder-disabled="true"
+                :reference-drag-disabled="true"
+                :comment-label-width="sidebarCommentLabelWidths.get(stickyNode.node.id)"
+                :is-sticky-context="stickyProductionContext"
+                @context-menu="(event, node) => openSidebarContextMenu(event, node, contextMenuSlot.onContextMenu)"
+              />
+            </div>
+            <TreeItem v-if="stickyTableSearchNode" :key="stickyTableSearchNode.renderKey" :node="stickyTableSearchNode.node" :depth="stickyTableSearchNode.depth" :reorder-disabled="true" :reference-drag-disabled="true" />
+          </div>
+        </div>
+        <div v-if="stickyProductionContext" class="sidebar-sticky-production" :style="{ top: `${stickyConnectionHeight}px`, height: `${sidebarTreeRowHeight}px` }">
           <ProductionContextBadge compact />
         </div>
         <div
@@ -3143,6 +3504,19 @@ defineExpose({
     <div v-if="store.treeNodes.length === 0" class="px-3 py-8 text-center text-muted-foreground text-xs">
       {{ t("sidebar.noConnections") }}
     </div>
+    <div v-else-if="deferredSearchQuery && !isSidebarSearchLoading && flatNodes.length === 0 && !(regexMode && compileSearchRegex(deferredSearchQuery).invalid)" class="px-3 py-5 text-center text-xs text-muted-foreground">
+      <p role="status">{{ t("grid.noSearchResults") }}</p>
+      <Button
+        v-if="!regexMode && !settingsStore.editorSettings.sidebarGlobalSearchLocal && settingsStore.editorSettings.sidebarSearchOpenedDatabasesOnly && store.connectedIds.size > 0"
+        variant="ghost"
+        size="sm"
+        class="mt-1 h-auto max-w-full whitespace-normal text-primary"
+        :title="t('settings.sidebarSearchOpenedDatabasesOnlyDescription')"
+        @click="settingsStore.updateEditorSettings({ sidebarSearchOpenedDatabasesOnly: false })"
+      >
+        {{ t("sidebar.searchAllDatabases") }}
+      </Button>
+    </div>
   </div>
 </template>
 
@@ -3150,14 +3524,14 @@ defineExpose({
 .sidebar-sticky-production {
   pointer-events: none;
   position: absolute;
-  top: 0;
   right: 8px;
   z-index: 6;
   display: flex;
   align-items: center;
 }
 
-.sticky-database-header {
+.sticky-database-header,
+.sticky-connection-header {
   background-color: var(--sidebar);
   container-type: inline-size;
   overflow: clip;

@@ -68,6 +68,7 @@ export const plDebugRead = forward("plDebugRead", false);
 
 // Connection
 export const testConnection = forward("testConnection");
+export const connectionParameters = forward("connectionParameters", false);
 export const testSshTunnel = forward("testSshTunnel");
 export const testConnectionWithInfo = forward("testConnectionWithInfo");
 export const salesforceOauthBrowserAuthorize = forward("salesforceOauthBrowserAuthorize");
@@ -203,6 +204,7 @@ export const deleteSavedSqlFile = forward("deleteSavedSqlFile");
 export const savedSqlStorageDir = forward("savedSqlStorageDir");
 export const openSavedSqlStorageDir = forward("openSavedSqlStorageDir");
 export const revealPathInFileManager = forward("revealPathInFileManager");
+export const openPathWithDefaultApp = forward("openPathWithDefaultApp");
 export const deleteDatabaseBackupFiles = forward("deleteDatabaseBackupFiles");
 export const databaseBackupCommand = forward("databaseBackupCommand");
 export const databaseBackupBackground = forward("databaseBackupBackground");
@@ -367,6 +369,7 @@ export const prepareOracleTriggerSql = forward("prepareOracleTriggerSql");
 export const fingerprintOracleRoutineObjectSource = forward("fingerprintOracleRoutineObjectSource");
 export const buildExecutableObjectSourceSql = forward("buildExecutableObjectSourceSql");
 export const buildEditableObjectSource = forward("buildEditableObjectSource");
+export const buildOracleObjectExportSql = forward("buildOracleObjectExportSql");
 export const buildRoutineRenameObjectSourceStatements = forward("buildRoutineRenameObjectSourceStatements");
 export const rewriteOracleRoutineReferences = forward("rewriteOracleRoutineReferences");
 export const rewriteOracleTableReferences = forward("rewriteOracleTableReferences");
@@ -432,6 +435,14 @@ export const loadDesktopSettings = forward("loadDesktopSettings");
 export const saveDesktopSettings = forward("saveDesktopSettings");
 export const loadMcpGlobalPolicy = forward("loadMcpGlobalPolicy");
 export const saveMcpGlobalPolicy = forward("saveMcpGlobalPolicy");
+export const loadMcpToolCatalog = forward("loadMcpToolCatalog");
+export const listPluginMcpViews = forward("listPluginMcpViews");
+export const loadMcpAccessPolicy = forward("loadMcpAccessPolicy");
+export const resetInvalidMcpAccessPolicy = forward("resetInvalidMcpAccessPolicy");
+export const setMcpPluginScopeRule = forward("setMcpPluginScopeRule");
+export const loadPluginMcpView = forward("loadPluginMcpView");
+export const listMcpPluginScopes = forward("listMcpPluginScopes");
+export const savePluginMcpGrant = forward("savePluginMcpGrant");
 export const loadMaxAgentTurns = forward("loadMaxAgentTurns");
 export const loadSqlFileUploadMaxBytes = forward("loadSqlFileUploadMaxBytes");
 export const saveSqlFileUploadMaxMb = forward("saveSqlFileUploadMaxMb");
@@ -547,6 +558,7 @@ export const saveExternalSqlFile = forward("saveExternalSqlFile");
 export const listSqlFilesInFolder = forward("listSqlFilesInFolder");
 export const searchSqlFileContents = forward("searchSqlFileContents");
 export const globalSearch = forward("globalSearch");
+export const cancelGlobalSearch = forward("cancelGlobalSearch");
 export const loadGlobalSearchSettings = forward("loadGlobalSearchSettings");
 export const saveGlobalSearchSettings = forward("saveGlobalSearchSettings");
 export const createSqlFileInFolder = forward("createSqlFileInFolder");
@@ -659,6 +671,7 @@ export type { DamengDumpKind, DamengDumpRequest, DamengDumpProgress } from "./da
 export const redisListDatabases = forward("redisListDatabases");
 export const redisScanKeys = forward("redisScanKeys");
 export const redisScanKeysBatch = forward("redisScanKeysBatch");
+export const redisKeyMetadataBatch = forward("redisKeyMetadataBatch");
 export const redisScanValues = forward("redisScanValues");
 export const redisGetValue = forward("redisGetValue");
 export const redisGetRawValue = forward("redisGetRawValue");
@@ -1031,6 +1044,8 @@ export const rotateWebMcpToken = forward("rotateWebMcpToken");
 export const loadWebCapabilities = forward("loadWebCapabilities");
 export const checkForUpdates = forward("checkForUpdates");
 export const fetchChangelog = forward("fetchChangelog");
+export const fetchChangelogIndex = forward("fetchChangelogIndex");
+export const fetchChangelogRelease = forward("fetchChangelogRelease");
 export const getSystemProxyUrl = forward("getSystemProxyUrl");
 export const downloadUpdate = forward("downloadUpdate");
 export const cancelUpdateDownload = forward("cancelUpdateDownload");
@@ -1119,6 +1134,7 @@ export type {
   RedisDatabaseInfo,
   RedisHashItem,
   RedisKeyInfo,
+  RedisKeyMetadata,
   RedisKeysExpiryResult,
   RedisListItem,
   RedisSetItem,
@@ -1219,6 +1235,7 @@ export type {
   TableImportRequest,
   TableImportSummary,
   TableImportProgress,
+  TableImportFailure,
   MongoImportFormat,
   MongoImportTypeMode,
   MongoImportInferredType,
@@ -1235,6 +1252,7 @@ export type {
   MongoExportProgress,
   MongoExportSummary,
   DatabaseExportRequest,
+  DatabaseExportSelectedObject,
   ExportProgress,
   TableExportProgress,
   TableExportStatus,
@@ -1263,3 +1281,6 @@ export const mqttGetTopicTree = forward("mqttGetTopicTree");
 export const mqttGetMessages = forward("mqttGetMessages");
 export const mqttClearMessages = forward("mqttClearMessages");
 export const mqttDeleteMessage = forward("mqttDeleteMessage");
+
+export const migrationPrepareCredentialReset = forward("migrationPrepareCredentialReset");
+export const migrationResetCredentials = forward("migrationResetCredentials");
