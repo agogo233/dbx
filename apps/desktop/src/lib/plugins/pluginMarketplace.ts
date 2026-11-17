@@ -1,5 +1,4 @@
 import type { InstalledPlugin, PluginMarketplaceArtifact, PluginMarketplacePlugin, PluginMarketplaceVersion, PluginRepository, PluginRepositoryCatalogResult } from "@/types/database";
-import { uuid } from "@/lib/common/utils";
 
 export type MarketplacePluginStatus = "install" | "installed" | "update" | "unsupported";
 
@@ -240,46 +239,6 @@ export function pluginSourceChange(listing: MarketplacePluginListing): PluginSou
 
 export function listingRepositoryCanVerify(repository: PluginRepository): boolean {
   return repository.kind === "official" || repository.kind === "enterprise";
-}
-
-const INSTALL_BEACON_URL = "https://dbxio.com/api/plugins/install";
-const INSTALLATION_ID_STORAGE_KEY = "dbx-installation-id";
-const INSTALLATION_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
-
-// Anonymous, purely random per-installation id so server-side stats can count
-// distinct machines without any user or hardware fingerprint. Clearing local
-// storage (or reinstalling) regenerates it, which is acceptable for
-// decorative statistics.
-function installationClientId(): string {
-  try {
-    if (typeof localStorage === "undefined") return "";
-    let id = localStorage.getItem(INSTALLATION_ID_STORAGE_KEY);
-    if (!id || !INSTALLATION_ID_PATTERN.test(id)) {
-      id = uuid();
-      localStorage.setItem(INSTALLATION_ID_STORAGE_KEY, id);
-    }
-    return id;
-  } catch {
-    return "";
-  }
-}
-
-export type PluginInstallBeaconKind = "install" | "update";
-
-// Fire-and-forget install beacon for marketplace statistics; never blocks or
-// fails the install. `kind` separates fresh installs from version updates so
-// update traffic cannot inflate the install numbers.
-export function beaconPluginInstall(pluginId: string, version: string, kind: PluginInstallBeaconKind = "install"): void {
-  try {
-    void fetch(INSTALL_BEACON_URL, {
-      method: "POST",
-      headers: { "Content-Type": "text/plain" },
-      body: JSON.stringify({ id: pluginId, version, kind, clientId: installationClientId() }),
-      keepalive: true,
-    }).catch(() => undefined);
-  } catch {
-    // Statistics are best-effort.
-  }
 }
 
 export function filterMarketplacePluginListings(listings: readonly MarketplacePluginListing[], query: string, repositoryId: string): MarketplacePluginListing[] {

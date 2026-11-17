@@ -56,7 +56,6 @@ import { createFrontendPluginRegistry, pluginConnectionProviderIcon } from "@/li
 import { collectPluginShortcuts, type PluginShortcutEntry } from "@/lib/plugins/pluginShortcuts";
 import { executePluginCommand } from "@/lib/plugins/pluginCommandRegistry";
 import {
-  beaconPluginInstall,
   buildInstalledUpdateIndex,
   buildMarketplacePluginListings,
   compareVersions,
@@ -725,7 +724,6 @@ async function installListing(listing: MarketplacePluginListing, allowSourceChan
     allowSourceChange: allowSourceChange || undefined,
   });
   notifyPluginRuntimeReplaced(result.plugin.manifest.id);
-  beaconPluginInstall(listing.plugin.id, listing.plugin.latestVersion, listing.status === "update" ? "update" : "install");
   return result;
 }
 
@@ -1151,25 +1149,8 @@ async function handleWebPackage(event: Event) {
   if (file) await installPlugin(file);
 }
 
-// Fire-and-forget install beacon for the marketplace stats worker
-// (deploy/plugin-stats-worker, POST dbxio.com/api/plugins/install).
-// Decorative counters only: no auth, no PII, failures are never surfaced.
-function reportInstallBeacon(result: PluginInstallResult) {
-  try {
-    void fetch("https://dbxio.com/api/plugins/install", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ id: result.plugin.manifest.id, version: result.plugin.manifest.version }),
-      keepalive: true,
-    }).catch(() => {});
-  } catch {
-    // stats only — ignore beacon failures
-  }
-}
-
 async function finishInstall(result: PluginInstallResult) {
   notifyPluginRuntimeReplaced(result.plugin.manifest.id);
-  reportInstallBeacon(result);
   toast(t("pluginPlatform.installSuccess", { name: result.plugin.manifest.name, version: result.plugin.manifest.version }));
   clearPluginIconCache();
   notifyComponentPluginsUpdated();

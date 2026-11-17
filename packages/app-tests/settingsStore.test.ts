@@ -434,16 +434,16 @@ test("defaults auto-close brackets to on and preserves saved booleans", () => {
 test("defaults update notifications to disabled", () => {
   assert.equal(DEFAULT_EDITOR_SETTINGS.updateNotificationsEnabled, false);
   assert.equal(DEFAULT_EDITOR_SETTINGS.autoUpdateApp, false);
-  assert.equal(DEFAULT_EDITOR_SETTINGS.autoUpdateDrivers, true);
-  assert.equal(DEFAULT_EDITOR_SETTINGS.autoUpdateJdbc, true);
-  assert.equal(DEFAULT_EDITOR_SETTINGS.autoUpdateMcp, true);
-  assert.equal(DEFAULT_EDITOR_SETTINGS.autoUpdatePlugins, true);
+  assert.equal(DEFAULT_EDITOR_SETTINGS.autoUpdateDrivers, false);
+  assert.equal(DEFAULT_EDITOR_SETTINGS.autoUpdateJdbc, false);
+  assert.equal(DEFAULT_EDITOR_SETTINGS.autoUpdateMcp, false);
+  assert.equal(DEFAULT_EDITOR_SETTINGS.autoUpdatePlugins, false);
   assert.equal(normalizeEditorSettings({}).updateNotificationsEnabled, false);
   assert.equal(normalizeEditorSettings({}).autoUpdateApp, false);
-  assert.equal(normalizeEditorSettings({}).autoUpdateDrivers, true);
-  assert.equal(normalizeEditorSettings({}).autoUpdateJdbc, true);
-  assert.equal(normalizeEditorSettings({}).autoUpdateMcp, true);
-  assert.equal(normalizeEditorSettings({}).autoUpdatePlugins, true);
+  assert.equal(normalizeEditorSettings({}).autoUpdateDrivers, false);
+  assert.equal(normalizeEditorSettings({}).autoUpdateJdbc, false);
+  assert.equal(normalizeEditorSettings({}).autoUpdateMcp, false);
+  assert.equal(normalizeEditorSettings({}).autoUpdatePlugins, false);
   assert.equal(normalizeEditorSettings({ updateNotificationsEnabled: false } as any).updateNotificationsEnabled, false);
   assert.equal(normalizeEditorSettings({ updateNotificationsEnabled: false } as any).autoUpdateApp, false);
   assert.equal(normalizeEditorSettings({ updateNotificationsEnabled: false } as any).autoUpdateDrivers, false);
@@ -451,16 +451,16 @@ test("defaults update notifications to disabled", () => {
   assert.equal(normalizeEditorSettings({ updateNotificationsEnabled: false } as any).autoUpdateMcp, false);
   assert.equal(normalizeEditorSettings({ updateNotificationsEnabled: false } as any).autoUpdatePlugins, false);
   assert.equal(normalizeEditorSettings({ autoDownloadUpdates: false }).autoUpdateApp, false);
-  assert.equal(normalizeEditorSettings({ autoDownloadUpdates: false }).autoUpdateDrivers, true);
-  assert.equal(normalizeEditorSettings({ autoDownloadUpdates: false }).autoUpdateJdbc, true);
-  assert.equal(normalizeEditorSettings({ autoDownloadUpdates: false }).autoUpdateMcp, true);
-  assert.equal(normalizeEditorSettings({ autoDownloadUpdates: false }).autoUpdatePlugins, true);
+  assert.equal(normalizeEditorSettings({ autoDownloadUpdates: false }).autoUpdateDrivers, false);
+  assert.equal(normalizeEditorSettings({ autoDownloadUpdates: false }).autoUpdateJdbc, false);
+  assert.equal(normalizeEditorSettings({ autoDownloadUpdates: false }).autoUpdateMcp, false);
+  assert.equal(normalizeEditorSettings({ autoDownloadUpdates: false }).autoUpdatePlugins, false);
   assert.equal(normalizeEditorSettings({ autoUpdateApp: false }).updateNotificationsEnabled, false);
   assert.equal(normalizeEditorSettings({ autoUpdateApp: false }).autoUpdateApp, false);
-  assert.equal(normalizeEditorSettings({ autoUpdateApp: false }).autoUpdateDrivers, true);
-  assert.equal(normalizeEditorSettings({ autoUpdateApp: false }).autoUpdateJdbc, true);
-  assert.equal(normalizeEditorSettings({ autoUpdateApp: false }).autoUpdateMcp, true);
-  assert.equal(normalizeEditorSettings({ autoUpdateApp: false }).autoUpdatePlugins, true);
+  assert.equal(normalizeEditorSettings({ autoUpdateApp: false }).autoUpdateDrivers, false);
+  assert.equal(normalizeEditorSettings({ autoUpdateApp: false }).autoUpdateJdbc, false);
+  assert.equal(normalizeEditorSettings({ autoUpdateApp: false }).autoUpdateMcp, false);
+  assert.equal(normalizeEditorSettings({ autoUpdateApp: false }).autoUpdatePlugins, false);
 });
 
 test("centralized automatic updates default on while explicit category opt-outs are preserved", () => {
