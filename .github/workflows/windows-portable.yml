@@ -9,7 +9,11 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  RUSTFLAGS: -C debuginfo=line-tables-only
+  # An env RUSTFLAGS replaces .cargo/config.toml target rustflags, so the
+  # 8 MiB main-thread stack link arg must be repeated here (matches the
+  # upstream release workflow) or the portable exe keeps the 1 MiB default
+  # and aborts with 0xC00000FD on deep driver/serde call stacks.
+  RUSTFLAGS: -C debuginfo=line-tables-only -C link-arg=/STACK:8388608
   CARGO_INCREMENTAL: "0"
 
 jobs:
@@ -79,10 +83,26 @@ jobs:
         # frontend into the binary, matching the upstream release path.
         run: pnpm tauri build --no-bundle --target x86_64-pc-windows-msvc -- --locked
 
+      - name: Resolve DBX version
+        id: setver
+        shell: pwsh
+        run: |
+          $cargoMetadata = cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
+          $version = ($cargoMetadata.packages | Where-Object { $_.name -eq "dbx" } | Select-Object -First 1).version
+          if (!$version) {
+            throw "dbx package version not found via cargo metadata"
+          }
+          $packageJsonVersion = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          if ($packageJsonVersion -ne $version) {
+            Write-Host "WARNING: package.json version ($packageJsonVersion) differs from dbx crate version ($version)"
+          }
+          Write-Host "DBX version: $version"
+          "version=$version" >> $GITHUB_OUTPUT
+
       - name: Package portable ZIP
         shell: pwsh
         run: |
-          $version = "dev"
+          $version = "${{ steps.setver.outputs.version }}"
           $arch = "x64"
           $portableDir = "DBX-${version}-${arch}"
           $zipName = "DBX-${version}-${arch}-portable.zip"
@@ -112,8 +132,8 @@ jobs:
       - name: Upload portable artifact
         uses: actions/upload-artifact@v4
         with:
-          name: DBX-dev-x64-portable
-          path: DBX-dev-x64-portable.zip
+          name: DBX-${{ steps.setver.outputs.version }}-x64-portable
+          path: DBX-${{ steps.setver.outputs.version }}-x64-portable.zip
           if-no-files-found: error
           retention-days: 7
 
