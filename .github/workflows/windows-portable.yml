@@ -86,19 +86,19 @@ jobs:
 
       - name: Resolve DBX version
         id: setver
-        shell: pwsh
+        shell: bash
         run: |
-          $cargoMetadata = cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
-          $version = ($cargoMetadata.packages | Where-Object { $_.name -eq "dbx" } | Select-Object -First 1).version
-          if (!$version) {
-            throw "dbx package version not found via cargo metadata"
-          }
-          $packageJsonVersion = (Get-Content package.json -Raw | ConvertFrom-Json).version
-          if ($packageJsonVersion -ne $version) {
-            Write-Host "WARNING: package.json version ($packageJsonVersion) differs from dbx crate version ($version)"
-          }
-          Write-Host "DBX version: $version"
-          "version=$version" >> $GITHUB_OUTPUT
+          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "dbx") | .version' | head -1)
+          if [ -z "$version" ]; then
+            echo "dbx package version not found via cargo metadata" >&2
+            exit 1
+          fi
+          package_json_version=$(jq -r '.version' package.json)
+          if [ "$package_json_version" != "$version" ]; then
+            echo "WARNING: package.json version ($package_json_version) differs from dbx crate version ($version)"
+          fi
+          echo "DBX version: $version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
 
       - name: Package portable ZIP
         shell: pwsh
